@@ -513,18 +513,20 @@ class DynamicVolatilityGridReaper:
         self.logger.info("Graceful shutdown complete")
 
     async def ensure_positions_flattened(self) -> None:
-        if self.dry_run or self.batch_manager:
+        if self.batch_manager or self.dry_run:
             try:
                 await self.cancel_all_orders()
+                await self.wait_until_no_open_orders()
                 self.logger.info("Outstanding orders cancelled before exit")
             except Exception as exc:
                 self.logger.warning("Failed to cancel open orders on shutdown: %s", exc)
         else:
             self.logger.debug("Batch manager unavailable; skipping order cancellation")
 
-        if self.dry_run or (self.lighter and self.market_manager):
+        if self.lighter or self.dry_run:
             try:
                 await self.flatten_positions()
+                await self.wait_until_flat()
                 self.logger.info("Positions flattened before exit or already flat")
             except Exception as exc:
                 self.logger.warning("Failed to flatten positions on shutdown: %s", exc)
@@ -888,6 +890,23 @@ class DynamicVolatilityGridReaper:
             return
         await self.batch_manager.cancel_all_orders_safe()  # type: ignore[union-attr]
 
+    async def wait_until_no_open_orders(self, timeout: float = 12.0) -> None:
+        if self.dry_run or not self.lighter:
+            return
+        deadline = time.time() + timeout
+        last_count = None
+        while time.time() < deadline:
+            active = await self.fetch_active_orders()
+            count = len(active)
+            if count == 0:
+                return
+            if last_count != count:
+                self.logger.info("Waiting for open orders to clear (%d remaining)", count)
+                last_count = count
+            await asyncio.sleep(0.5)
+        if last_count:
+            self.logger.warning("Timed out waiting for %d open orders to cancel", last_count)
+
     async def cancel_orders(self, order_ids: List[str]) -> None:
         if not order_ids:
             return
@@ -972,6 +991,31 @@ class DynamicVolatilityGridReaper:
                 await self.lighter.market_order(self.symbol, qty)  # type: ignore[union-attr]
             except Exception as exc:
                 self.logger.error("Failed to close short: %s", exc)
+
+    async def wait_until_flat(self, timeout: float = 15.0) -> None:
+        if self.dry_run or not self.lighter:
+            return
+        deadline = time.time() + timeout
+        last_state: Optional[Tuple[float, float]] = None
+        while time.time() < deadline:
+            long_qty, short_qty = await self.fetch_positions()
+            state = (long_qty, short_qty)
+            if long_qty <= 0 and short_qty <= 0:
+                return
+            if last_state != state:
+                self.logger.info(
+                    "Waiting for positions to flatten (long=%.6f, short=%.6f)",
+                    long_qty,
+                    short_qty,
+                )
+                last_state = state
+            await asyncio.sleep(0.75)
+        if last_state and any(q > 0 for q in last_state):
+            self.logger.warning(
+                "Timed out waiting for positions to flatten (long=%.6f, short=%.6f)",
+                last_state[0],
+                last_state[1],
+            )
 
     async def fetch_positions(self) -> Tuple[float, float]:
         if self.dry_run:

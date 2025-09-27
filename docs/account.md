@@ -1,27 +1,35 @@
 # Account Types
+
 Lighter API users can operate under a Standard or Premium account.
 
-*   Fees: 0.002% Maker, 0.02% Taker
-*   maker/cancel latency: 0ms
-*   taker latency: 150ms
+#### Premium Account (Opt-in) -- Suitable for HFT, the lowest latency on Lighter.
 
-  
+* Fees: 0.002% Maker, 0.02% Taker
+* maker/cancel latency: 0ms
+* taker latency: 150ms
+* part of [volume quota program](/docs/volume-quota-program)
 
-*   fees: 0 maker / 0 taker
-*   taker latency: 300ms
-*   maker/cancel latency: 200ms
+#### Standard Account (Default) -- Suitable for retail and latency insensitive traders.
+
+* fees: 0 maker / 0 taker
+* taker latency: 300ms
+* maker/cancel latency: 200ms
+
+#### Account Switch
 
 You can change your Account Type (tied to your L1 address) using the `/changeAccountTier` endpoint.
 
 You may call that endpoint if:
 
-*   You have no open positions
-*   You have no open orders
-*   At least 3 hours have passed since the last call
+* You have no open positions
+* You have no open orders
+* At least 3 hours have passed since the last call
 
-_Python snippet to switch tiers_:
+*Python snippet to switch tiers*:
 
-```switch to Premium
+Python: switch to premiumPython: switch to standard
+
+```
 import asyncio
 import logging
 import lighter
@@ -35,7 +43,6 @@ BASE_URL = "https://mainnet.zklighter.elliot.ai"
 # API_KEY_PRIVATE_KEY =
 # ACCOUNT_INDEX =
 # API_KEY_INDEX =
-
 
 async def main():
     client = lighter.SignerClient(
@@ -64,14 +71,11 @@ async def main():
         return
     print(response.json())
 
-
 if __name__ == "__main__":
     asyncio.run(main())
-
 ```
 
-
-```switch to standard
+```
 import asyncio
 import logging
 import lighter
@@ -85,7 +89,6 @@ BASE_URL = "https://mainnet.zklighter.elliot.ai"
 # API_KEY_PRIVATE_KEY =
 # ACCOUNT_INDEX =
 # API_KEY_INDEX =
-
 
 async def main():
     client = lighter.SignerClient(
@@ -114,13 +117,14 @@ async def main():
         return
     print(response.json())
 
-
 if __name__ == "__main__":
     asyncio.run(main())
-
 ```
 
+#### How fees are collected:
 
 In isolated margin, fees are taken from the isolated position itself, but if needed, we automatically transfer from cross margin to keep the position healthy. In cross margin, fees are always deducted directly from the available cross balance.
 
 Sub-accounts share the same tier as the main L1 address on the account. You’ll be able to switch to a Premium Account now. Let us know if you have any questions.
+
+Updated 16 days ago

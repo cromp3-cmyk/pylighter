@@ -9,9 +9,15 @@ WebSocket Management Utilities - Pure SDK Functions
 import asyncio
 import json
 import logging
-import websockets
 import time
-from typing import Callable, Optional, Dict, Any
+from typing import Callable, Optional, Dict, Any, List
+
+import websockets
+
+try:
+    from lighter import Configuration
+except Exception:  # pragma: no cover - fallback when lighter is unavailable
+    Configuration = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -228,84 +234,233 @@ class AccountWebSocketManager:
 class PriceWebSocketManager:
     """价格 WebSocket 管理器 - 处理订单簿更新"""
 
-    def __init__(self, market_ids: list):
-        self.market_ids = market_ids
-        self.ws_client = None
+    def __init__(self, market_ids: List[int], base_url: Optional[str] = None) -> None:
+        self.market_ids: List[int] = [int(mid) for mid in market_ids]
         self.shutdown_requested = False
 
         # 回调函数
-        self.on_price_update: Optional[Callable] = None
+        self.on_price_update: Optional[Callable[[int, Dict[str, Any]], None]] = None
 
         # 重连配置
         self.max_retries = 10
         self.retry_delay = 3
 
-    def set_price_callback(self, callback: Callable[[int, Dict], None]):
+        self._order_books: Dict[int, Dict[str, List[Dict[str, Any]]]] = {}
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+
+        self._base_url = base_url or (Configuration.get_default().host if Configuration else None)
+        self._ws_url = self._build_ws_url(self._base_url)
+
+    @staticmethod
+    def _build_ws_url(base_url: Optional[str]) -> str:
+        if not base_url:
+            return "wss://mainnet.zklighter.elliot.ai/stream"
+
+        if base_url.startswith("ws"):
+            return base_url.rstrip("/") + "/stream"
+
+        if base_url.startswith("http"):
+            return base_url.replace("https", "wss", 1).replace("http", "ws", 1).rstrip("/") + "/stream"
+
+        return f"wss://{base_url.rstrip('/')}" + "/stream"
+
+    def set_price_callback(self, callback: Callable[[int, Dict[str, Any]], None]) -> None:
         """设置价格更新回调函数"""
         self.on_price_update = callback
 
-    async def initialize_and_run(self):
+    async def initialize_and_run(self) -> None:
         """初始化并运行价格 WebSocket"""
-        import lighter
-
-        def on_order_book_update(market_id, order_book):
-            try:
-                # 跳过 ping/pong 处理
-                if isinstance(order_book, dict) and order_book.get('type') in ['ping', 'pong']:
-                    return
-
-                if self.on_price_update and int(market_id) in self.market_ids:
-                    self.on_price_update(int(market_id), order_book)
-
-            except Exception as e:
-                if not any(keyword in str(e).lower() for keyword in ['ping', 'pong', 'connection']):
-                    logger.error(f"价格更新处理错误: {e}")
-
-        # 创建 WebSocket 客户端
-        self.ws_client = lighter.WsClient(
-            order_book_ids=self.market_ids,
-            account_ids=[],
-            on_order_book_update=on_order_book_update,
-            on_account_update=lambda a, b: None,
-        )
-
-        logger.info(f"✅ 价格 WebSocket 初始化完成 (市场: {self.market_ids})")
-
-        # 运行 WebSocket (带重连)
+        logger.info("✅ 价格 WebSocket 初始化完成 (市场: %s)", self.market_ids)
         await self._run_with_retry()
 
-    async def _run_with_retry(self):
-        """运行 WebSocket 带重连逻辑"""
+    async def _run_with_retry(self) -> None:
         retry_count = 0
 
         while not self.shutdown_requested and retry_count < self.max_retries:
             try:
-                logger.info("🌐 启动价格 WebSocket 连接...")
-                retry_count = 0  # 重置计数
-                await self.ws_client.run_async()
-            except Exception as e:
-                retry_count += 1
-
-                # 过滤非关键错误
-                error_msg = str(e).lower()
-                is_critical = not any(keyword in error_msg for keyword in [
-                    'ping', 'pong', 'connection reset', 'connection closed', 'timeout'
-                ])
-
-                if is_critical:
-                    logger.error(f"价格 WebSocket 关键错误: {e}")
+                if retry_count == 0:
+                    logger.info("🌐 启动价格 WebSocket 连接...")
                 else:
-                    logger.debug(f"价格 WebSocket 非关键错误: {e}")
-
-                if retry_count < self.max_retries:
-                    wait_time = min(self.retry_delay * min(retry_count, 3), 30)
-                    logger.info(f"⏳ 价格 WebSocket {wait_time}秒后重试 (第{retry_count}/{self.max_retries}次)")
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error("❌ 价格 WebSocket 最大重试次数已达到")
+                    logger.info(
+                        "🌐 重试价格 WebSocket 连接 (第%d/%d次)",
+                        retry_count + 1,
+                        self.max_retries,
+                    )
+                await self._connect_once()
+                if self.shutdown_requested:
                     break
+                retry_count = 0
+            except asyncio.CancelledError:
+                raise
+            except websockets.exceptions.WebSocketException as exc:
+                retry_count += 1
+                self._log_websocket_error(exc, retry_count)
+                if retry_count < self.max_retries and not self.shutdown_requested:
+                    wait_time = min(self.retry_delay * min(retry_count, 3), 30)
+                    logger.info("⏳ 价格 WebSocket %d秒后重试 (第%d/%d次)", wait_time, retry_count, self.max_retries)
+                    await asyncio.sleep(wait_time)
+            except Exception as exc:
+                retry_count += 1
+                logger.error("价格 WebSocket 未知错误: %s", exc)
+                if retry_count < self.max_retries and not self.shutdown_requested:
+                    wait_time = min(self.retry_delay * min(retry_count, 3), 30)
+                    logger.info("⏳ 价格 WebSocket %d秒后重试 (第%d/%d次)", wait_time, retry_count, self.max_retries)
+                    await asyncio.sleep(wait_time)
+        else:
+            if retry_count >= self.max_retries:
+                logger.error("❌ 价格 WebSocket 最大重试次数已达到")
 
-    def shutdown(self):
+    async def _connect_once(self) -> None:
+        self._order_books.clear()
+        try:
+            async with websockets.connect(self._ws_url) as ws:
+                self._ws = ws
+                async for raw in ws:
+                    if self.shutdown_requested:
+                        break
+                    await self._handle_message(ws, raw)
+        finally:
+            self._ws = None
+
+    async def _handle_message(self, ws: websockets.WebSocketClientProtocol, raw: str) -> None:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.debug("忽略非 JSON WebSocket 消息: %s", exc)
+            return
+
+        msg_type = data.get("type")
+
+        if msg_type == "connected":
+            await self._subscribe_markets(ws)
+            return
+
+        if msg_type == "ping":
+            await ws.send(json.dumps({"type": "pong"}))
+            return
+
+        if msg_type == "subscribed/order_book":
+            self._handle_snapshot(data)
+            return
+
+        if msg_type == "update/order_book":
+            self._handle_incremental(data)
+            return
+
+        if msg_type == "error":
+            logger.warning("价格 WebSocket 错误消息: %s", data.get("message", data))
+            return
+
+        logger.debug("忽略未识别的价格消息类型: %s", msg_type)
+
+    async def _subscribe_markets(self, ws: websockets.WebSocketClientProtocol) -> None:
+        for market_id in self.market_ids:
+            payload = {
+                "type": "subscribe",
+                "channel": f"order_book/{market_id}",
+            }
+            await ws.send(json.dumps(payload))
+        logger.info("📡 已发送价格订阅请求: %s", self.market_ids)
+
+    def _handle_snapshot(self, data: Dict[str, Any]) -> None:
+        channel = data.get("channel", "")
+        try:
+            market_id = int(channel.split(":")[1])
+        except (IndexError, ValueError):
+            logger.debug("快照消息缺少市场信息: %s", channel)
+            return
+
+        order_book = data.get("order_book", {})
+        if not order_book:
+            return
+
+        self._order_books[market_id] = self._normalize_book(order_book)
+        self._emit_update(market_id)
+
+    def _handle_incremental(self, data: Dict[str, Any]) -> None:
+        channel = data.get("channel", "")
+        try:
+            market_id = int(channel.split(":")[1])
+        except (IndexError, ValueError):
+            logger.debug("增量消息缺少市场信息: %s", channel)
+            return
+
+        if market_id not in self._order_books:
+            # 没有快照时直接忽略，等待下一次完整快照
+            logger.debug("收到增量更新但缺少基础快照，等待下次快照 (市场 %s)", market_id)
+            return
+
+        order_book = data.get("order_book", {})
+        if not order_book:
+            return
+
+        current = self._order_books[market_id]
+        current["asks"] = self._apply_updates(order_book.get("asks", []), current.get("asks", []))
+        current["bids"] = self._apply_updates(order_book.get("bids", []), current.get("bids", []), reverse=True)
+        self._emit_update(market_id)
+
+    def _emit_update(self, market_id: int) -> None:
+        if self.on_price_update:
+            try:
+                book = self._order_books[market_id]
+                payload = {
+                    "asks": [dict(item) for item in book.get("asks", [])],
+                    "bids": [dict(item) for item in book.get("bids", [])],
+                }
+                self.on_price_update(market_id, payload)
+            except Exception as exc:
+                logger.error("价格更新回调错误: %s", exc)
+
+    @staticmethod
+    def _normalize_book(order_book: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+        asks = sorted(order_book.get("asks", []), key=lambda x: float(x["price"]))
+        bids = sorted(order_book.get("bids", []), key=lambda x: float(x["price"]), reverse=True)
+        return {"asks": asks, "bids": bids}
+
+    @staticmethod
+    def _apply_updates(
+        updates: List[Dict[str, Any]],
+        existing: List[Dict[str, Any]],
+        *,
+        reverse: bool = False,
+    ) -> List[Dict[str, Any]]:
+        price_map = {item["price"]: item for item in existing}
+        for entry in updates:
+            price = entry.get("price")
+            if price is None:
+                continue
+            size = float(entry.get("size", 0))
+            if size == 0:
+                price_map.pop(price, None)
+            else:
+                price_map[price] = entry
+
+        sorted_orders = sorted(
+            price_map.values(),
+            key=lambda x: float(x["price"]),
+            reverse=reverse,
+        )
+        return sorted_orders
+
+    def _log_websocket_error(self, exc: Exception, retry_count: int) -> None:
+        message = str(exc).lower()
+        noisy_keywords = ["ping", "pong", "connection reset", "connection closed", "timeout"]
+        if any(keyword in message for keyword in noisy_keywords):
+            logger.debug("价格 WebSocket 可恢复错误 (%s) 第%d次", exc, retry_count)
+        else:
+            logger.error("价格 WebSocket 错误 (%d/%d): %s", retry_count, self.max_retries, exc)
+
+    def shutdown(self) -> None:
         """关闭价格 WebSocket"""
         logger.info("🛑 关闭价格 WebSocket 管理器")
         self.shutdown_requested = True
+        ws = self._ws
+        if ws:
+            is_closed = getattr(ws, "closed", False)
+            if not is_closed:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop and loop.is_running():
+                    loop.create_task(ws.close())

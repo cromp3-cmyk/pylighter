@@ -1242,7 +1242,7 @@ def parse_args() -> argparse.Namespace:
         default="data/reaper_performance.db",
         help="Path to SQLite database storing performance snapshots (empty string disables persistence)",
     )
-    parser.add_argument("--enable-adaptive", action="store_true", help="Enable adaptive grid parameters based on volatility")
+    parser.add_argument("--enable-adaptive", action="store_true", default=True, help="Enable adaptive grid parameters based on volatility")
     parser.add_argument("--adaptive-low-vol", type=float, default=0.001, help="ATR/mid threshold considered low volatility")
     parser.add_argument("--adaptive-high-vol", type=float, default=0.01, help="ATR/mid threshold considered high volatility")
     parser.add_argument("--adaptive-multiplier-min", type=float, default=0.15, help="Minimum ATR multiplier when volatility is low")

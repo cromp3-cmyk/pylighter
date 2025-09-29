@@ -260,6 +260,7 @@ class Lighter():
         client_order_index=None,
         is_index=False,
         reduce_only=False,
+        order_expiry=None,
         **kwargs
     ):
         """Create a limit order.
@@ -280,10 +281,11 @@ class Lighter():
             client_order_index = SignerClient.ORDER_TYPE_LIMIT
 
         # Validate TIF
+        tif_key = tif
         tif_map = {'GTC': 1, 'IOC': 0, 'ALO': 2}
-        if tif not in tif_map:
-            raise ValueError(f"Invalid TIF: {tif}. Must be one of {list(tif_map.keys())}")
-        tif = tif_map[tif]
+        if tif_key not in tif_map:
+            raise ValueError(f"Invalid TIF: {tif_key}. Must be one of {list(tif_map.keys())}")
+        tif_value = tif_map[tif_key]
 
         # Validate amount and price
         if amount == 0:
@@ -309,6 +311,14 @@ class Lighter():
         price = round(price * 10**price_precision)
         base_amount = round(abs(amount) * 10**lot_precision)
 
+        if order_expiry is None:
+            if tif_key == 'IOC':
+                order_expiry = SignerClient.DEFAULT_IOC_EXPIRY
+            elif tif_key == 'GTC':
+                order_expiry = SignerClient.DEFAULT_28_DAY_ORDER_EXPIRY
+            else:
+                order_expiry = SignerClient.DEFAULT_28_DAY_ORDER_EXPIRY
+
         return await self.client.create_order(
             market_index=market_id,
             client_order_index=client_order_index,
@@ -316,9 +326,10 @@ class Lighter():
             price=price,
             is_ask=is_ask,
             order_type=0, #ORDER_TYPE_LIMIT
-            time_in_force=tif,
+            time_in_force=tif_value,
             reduce_only=int(reduce_only),
-            trigger_price=0
+            trigger_price=0,
+            order_expiry=order_expiry,
         )
 
     async def market_order(
@@ -372,6 +383,7 @@ class Lighter():
             price=price,
             tif=tif,
             reduce_only=reduce_only,
+            order_expiry=SignerClient.DEFAULT_IOC_EXPIRY if tif == 'IOC' else None,
             is_index=is_index,
             **kwargs
         )

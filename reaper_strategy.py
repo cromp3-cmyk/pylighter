@@ -11,7 +11,50 @@ Usage / 使用说明:
     - `--performance-db` 可自定义 SQLite 存储路径，传空字符串关闭持久化。
     - 启用 `--enable-adaptive` 后，ATR 比例会自动调节网格间距、层数与 ADX 阈值；
       可配合 `--adaptive-*` 选项微调阈值。
+    - `--trend-exit-mode` 控制趋势行情下如何处理现有挂单（pause/cancel/flatten）。
     - 性能统计默认每 120 秒写入一次，可用 `--performance-interval` 调整。
+
+Key arguments / 关键参数:
+    --symbol:
+        Trading pair to manage. Defaults to `BTC` and works with any market the
+        pylighter SDK exposes.
+        交易对，默认 BTC，支持 pylighter SDK 已接入的任意品种。
+
+    --indicator-period:
+        Candlestick window length (in minutes) for ADX/ATR. Higher values smooth
+        signals but react slower.
+        ADX/ATR 指标使用的分钟 K 线周期，越大越平滑但响应越慢。
+
+    --atr-multiplier / --grid-layers:
+        Control grid spacing and depth when adaptive mode is disabled. When
+        adaptive mode is on (默认开启)，会根据波动率在 multiplier 和 layers 范围内自动调整。
+
+    --total-notional:
+        Total quote capital distributed across buys and sells (split 50/50).
+        网格分配的报价资金总额，买卖各占一半，用于限制风险敞口。
+
+    --stop-buffer:
+        Multiplier applied to spacing to position the master stop below the
+        lower channel. Larger buffers widen the protective band.
+        全局止损距离系数，越大越耐受极端波动。
+
+    --trend-exit-mode:
+        Behaviour when ADX indicates a trend:
+            pause   -> keep existing grid orders in place (默认)
+            cancel  -> remove resting orders but leave positions untouched
+            flatten -> cancel orders and flatten inventory
+        趋势模式下的处理策略：pause 保留已有挂单便于继续套利，cancel 清空挂单但保留仓位，
+        flatten 则全撤单并尝试平仓。
+
+    --performance-db / --performance-interval:
+        Manage persistence cadence for equity snapshots. Passing an empty string
+        disables SQLite tracking entirely.
+        控制收益追踪的持久化频率，传空字符串可关闭记录。
+
+Default behaviour / 默认行为:
+    Adaptive mode + pause exit keeps the grid earning through mild regime flips
+    while still obeying the master stop-loss. 在趋势触发时保留现有挂单、不强制平仓，
+    通常能兼顾震荡收益与突然行情的风险控制；需要更激进的防守可切换为 cancel 或 flatten。
 
 This strategy follows the design from ``reaper.md``:
 - Uses ADX to filter market regime (range vs trend)
@@ -367,6 +410,8 @@ class DynamicVolatilityGridReaper:
         adaptive_adx_min: float,
         adaptive_adx_max: float,
         performance_db: Optional[str],
+        trend_exit_mode: str,
+        max_position_ratio: float = 0.4,  # Maximum position as ratio of total_notional
     ) -> None:
         self.symbol = symbol
         self.dry_run = dry_run
@@ -392,6 +437,7 @@ class DynamicVolatilityGridReaper:
         self.adaptive_layers_max = adaptive_layers_max
         self.adaptive_adx_min = adaptive_adx_min
         self.adaptive_adx_max = adaptive_adx_max
+        self.max_position_ratio = max_position_ratio
 
         # Sanity guards for adaptive ranges
         if self.adaptive_layers_max < self.adaptive_layers_min:
@@ -411,6 +457,14 @@ class DynamicVolatilityGridReaper:
             )
         if self.adaptive_high_vol <= self.adaptive_low_vol:
             self.adaptive_high_vol = self.adaptive_low_vol + 1e-6
+
+        allowed_trend_modes = {"pause", "cancel", "flatten"}
+        normalized_trend_mode = trend_exit_mode.lower()
+        if normalized_trend_mode not in allowed_trend_modes:
+            raise ValueError(
+                f"trend_exit_mode must be one of {sorted(allowed_trend_modes)}, got '{trend_exit_mode}'"
+            )
+        self.trend_exit_mode = normalized_trend_mode
 
         self.logger = get_strategy_logger("reaper")
 
@@ -435,6 +489,8 @@ class DynamicVolatilityGridReaper:
         self.stop_triggered: bool = False
         self.shutdown: bool = False
 
+        self.pending_flatten: bool = False
+
         self.state_lock = asyncio.Lock()
         self.plan_dirty = asyncio.Event()
         self.tasks: List[asyncio.Task] = []
@@ -448,6 +504,10 @@ class DynamicVolatilityGridReaper:
         self.active_adx_threshold: float = adx_threshold
         self.active_grid_layers: int = grid_layers
         self._closed: bool = False
+
+        # Position tracking for risk management
+        self._last_long_position: float = 0.0
+        self._last_short_position: float = 0.0
 
     # --- setup & teardown -------------------------------------------------
 
@@ -615,7 +675,12 @@ class DynamicVolatilityGridReaper:
         adaptive_spacing = max(min_spacing, state.atr * self.active_atr_multiplier)
         stop_loss = max(0.0, state.lower - adaptive_spacing * self.stop_buffer)
 
+        new_regime = "range" if state.adx < self.active_adx_threshold else "trend"
+        regime_changed = False
+
         async with self.state_lock:
+            previous_regime = self.regime
+            previous_grid_active = self.grid_active
             should_reset_stop = (
                 self.stop_triggered and state.mid > stop_loss and state.adx < self.active_adx_threshold
             )
@@ -623,23 +688,36 @@ class DynamicVolatilityGridReaper:
                 self.logger.info("Conditions met to reset stop state")
                 self.stop_triggered = False
 
-            plan = self.build_grid_plan(state, adaptive_spacing) if not self.stop_triggered else []
+            if self.stop_triggered:
+                plan: List[OrderPlan] = []
+            elif new_regime == "range":
+                plan = self.build_grid_plan(state, adaptive_spacing)
+            else:
+                plan = []
 
             self.indicator_state = state
-            self.regime = "range" if state.adx < self.active_adx_threshold else "trend"
+            self.regime = new_regime
+            regime_changed = previous_regime != new_regime
 
             if self.regime == "trend":
-                plan = []
+                if self.trend_exit_mode == "flatten" and previous_regime != "trend":
+                    self.pending_flatten = True
 
             self.desired_orders = plan
             self.current_grid_spacing = adaptive_spacing
             self.stop_loss_price = stop_loss
-            self.grid_active = bool(plan)
+            if self.regime == "trend" and self.trend_exit_mode == "pause":
+                self.grid_active = previous_grid_active
+            else:
+                self.grid_active = bool(plan)
 
         if initial_bootstrap:
             self.plan_dirty.set()
         else:
             self.plan_dirty.set()
+
+        if regime_changed:
+            self.logger.info("Regime transition: %s -> %s", previous_regime, new_regime)
 
         self.logger.info(
             (
@@ -705,6 +783,34 @@ class DynamicVolatilityGridReaper:
 
         available_buy_quote = self.total_notional * 0.5
         available_sell_quote = self.total_notional * 0.5
+
+        # Position limits to prevent excessive one-sided exposure
+        max_position_value = self.total_notional * self.max_position_ratio
+
+        # Get current positions (use sync version since we're not in async context)
+        # We'll need to modify this to work with async, but for now we'll rely on last known positions
+        # This is a temporary approach - ideally we'd make this function async
+        current_long = getattr(self, '_last_long_position', 0.0)
+        current_short = getattr(self, '_last_short_position', 0.0)
+
+        long_position_value = current_long * reference_price
+        short_position_value = current_short * reference_price
+
+        # Reduce buy orders if long position is too large
+        if long_position_value > max_position_value * 0.7:  # 70% threshold
+            available_buy_quote *= 0.3  # Reduce buy capacity by 70%
+            self.logger.warning(
+                "Large long position detected (%.2f vs max %.2f), reducing buy orders",
+                long_position_value, max_position_value
+            )
+
+        # Reduce sell orders if short position is too large
+        if short_position_value > max_position_value * 0.7:  # 70% threshold
+            available_sell_quote *= 0.3  # Reduce sell capacity by 70%
+            self.logger.warning(
+                "Large short position detected (%.2f vs max %.2f), reducing sell orders",
+                short_position_value, max_position_value
+            )
 
         if available_buy_quote < constraints.min_quote_amount:
             self.logger.warning(
@@ -798,6 +904,8 @@ class DynamicVolatilityGridReaper:
                 if await self.cancel_all_orders_if_needed():
                     async with self.state_lock:
                         self.grid_active = False
+                if regime == "trend" and self.trend_exit_mode == "flatten":
+                    await self.ensure_flatten_positions_if_needed()
                 await asyncio.sleep(1)
                 continue
 
@@ -809,11 +917,88 @@ class DynamicVolatilityGridReaper:
                 await self.handle_stop_loss(stop_price, spacing)
 
     async def cancel_all_orders_if_needed(self) -> bool:
-        if not self.grid_active:
+        # Only cancel orders if we have active orders AND we should cancel them
+        existing_orders = await self.fetch_active_orders()
+        if not existing_orders:
             return False
-        self.logger.info("Deactivating grid orders")
-        await self.cancel_all_orders()
-        return True
+
+        cancel_reason: Optional[str] = None
+        if self.regime == "trend":
+            if self.trend_exit_mode in {"cancel", "flatten"}:
+                cancel_reason = f"trend-{self.trend_exit_mode}"
+        elif not self.grid_active:
+            cancel_reason = "inactive-grid"
+
+        if cancel_reason:
+            self.logger.info(
+                "Deactivating grid orders (%s) - regime=%s, active_orders=%d",
+                cancel_reason,
+                self.regime,
+                len(existing_orders),
+            )
+            await self.cancel_all_orders()
+            return True
+
+        return False
+
+    async def ensure_flatten_positions_if_needed(self) -> None:
+        if self.trend_exit_mode != "flatten" and not self.pending_flatten:
+            return
+
+        flatten_required = False
+
+        async with self.state_lock:
+            if self.pending_flatten:
+                flatten_required = True
+                self.pending_flatten = False
+
+        # Only check positions via API if we don't already know we need to flatten
+        # and we're not in dry run mode
+        if not flatten_required and not self.dry_run:
+            long_qty, short_qty = await self.fetch_positions()
+            # Get minimum base amount to avoid checking dust positions
+            constraints = self.market_constraints
+            min_base_amount = constraints.min_base_amount if constraints else 0.0
+
+            # Only consider positions above minimum trading amount as requiring flattening
+            flatten_required = (long_qty >= min_base_amount) or (short_qty >= min_base_amount)
+
+            if long_qty > 0 and long_qty < min_base_amount:
+                self.logger.debug("Ignoring dust long position %.6f (below minimum %.6f)", long_qty, min_base_amount)
+            if short_qty > 0 and short_qty < min_base_amount:
+                self.logger.debug("Ignoring dust short position %.6f (below minimum %.6f)", short_qty, min_base_amount)
+
+        if not flatten_required:
+            return
+
+        self.logger.info("Flattening residual exposure while in trend regime")
+
+        await self.flatten_positions()
+        await self.wait_until_flat()
+
+        # Only verify positions after flatten attempt if not in dry run
+        if not self.dry_run:
+            long_qty, short_qty = await self.fetch_positions()
+            constraints = self.market_constraints
+            min_base_amount = constraints.min_base_amount if constraints else 0.0
+
+            # Only consider significant positions as requiring retry
+            significant_positions = (long_qty >= min_base_amount) or (short_qty >= min_base_amount)
+
+            if significant_positions:
+                self.logger.warning(
+                    "Significant positions still detected after flatten attempt (long=%.6f, short=%.6f)",
+                    long_qty,
+                    short_qty,
+                )
+                async with self.state_lock:
+                    self.pending_flatten = True
+            elif long_qty > 0 or short_qty > 0:
+                self.logger.info(
+                    "Only dust positions remain after flatten (long=%.6f, short=%.6f), ignoring",
+                    long_qty,
+                    short_qty,
+                )
 
     async def sync_orders(self, desired_orders: List[OrderPlan]) -> bool:
         existing = await self.fetch_active_orders()
@@ -888,7 +1073,15 @@ class DynamicVolatilityGridReaper:
         if not self.batch_manager:
             self.logger.debug("Batch manager not initialized; skipping cancel_all_orders")
             return
-        await self.batch_manager.cancel_all_orders_safe()  # type: ignore[union-attr]
+
+        # Call cancel_all_orders_safe and log the result
+        result = await self.batch_manager.cancel_all_orders_safe()  # type: ignore[union-attr]
+
+        if result['success']:
+            self.logger.info("Successfully cancelled %d orders using %s method",
+                           result.get('cancelled_count', 0), result.get('method', 'unknown'))
+        else:
+            self.logger.error("Failed to cancel orders: %s", result.get('error', 'Unknown error'))
 
     async def wait_until_no_open_orders(self, timeout: float = 12.0) -> None:
         if self.dry_run or not self.lighter:
@@ -976,32 +1169,98 @@ class DynamicVolatilityGridReaper:
         if not self.lighter or not self.market_manager:
             self.logger.debug("Client not initialized; skipping flatten_positions")
             return
+
+        # Get minimum base amount for the current symbol
+        constraints = self.market_constraints
+        min_base_amount = constraints.min_base_amount if constraints else 0.0
+
         long_qty, short_qty = await self.fetch_positions()
         if long_qty > 0:
             qty = self.market_manager.format_quantity(long_qty, self.symbol)  # type: ignore[arg-type]
-            self.logger.info("Closing long position %.6f via market sell", qty)
-            try:
-                await self.lighter.market_order(self.symbol, -qty)  # type: ignore[union-attr]
-            except Exception as exc:
-                self.logger.error("Failed to close long: %s", exc)
+            if qty > 0:
+                # Check if position is above minimum trading amount
+                if qty < min_base_amount:
+                    self.logger.info("Long position %.6f below minimum %.6f, ignoring dust position", qty, min_base_amount)
+                else:
+                    self.logger.info("Closing long position %.6f via market sell", qty)
+                    if not await self._submit_market_order(-qty, reduce_only=True):
+                        self.logger.info("Retrying long close without reduce-only flag")
+                        if not await self._submit_market_order(-qty, reduce_only=False):
+                            async with self.state_lock:
+                                self.pending_flatten = True
         if short_qty > 0:
             qty = self.market_manager.format_quantity(short_qty, self.symbol)  # type: ignore[arg-type]
-            self.logger.info("Closing short position %.6f via market buy", qty)
-            try:
-                await self.lighter.market_order(self.symbol, qty)  # type: ignore[union-attr]
-            except Exception as exc:
-                self.logger.error("Failed to close short: %s", exc)
+            if qty > 0:
+                # Check if position is above minimum trading amount
+                if qty < min_base_amount:
+                    self.logger.info("Short position %.6f below minimum %.6f, ignoring dust position", qty, min_base_amount)
+                else:
+                    self.logger.info("Closing short position %.6f via market buy", qty)
+                    if not await self._submit_market_order(qty, reduce_only=True):
+                        self.logger.info("Retrying short close without reduce-only flag")
+                        if not await self._submit_market_order(qty, reduce_only=False):
+                            async with self.state_lock:
+                                self.pending_flatten = True
+
+    async def _submit_market_order(self, amount: float, reduce_only: bool) -> bool:
+        try:
+            order, response, error = await self.lighter.market_order(  # type: ignore[union-attr]
+                self.symbol,
+                amount,
+                reduce_only=reduce_only,
+            )
+            if error:
+                raise RuntimeError(f"market_order error: {error}")
+            if response is None:
+                raise RuntimeError("market_order returned no response")
+            if hasattr(response, "code") and response.code != 200:
+                raise RuntimeError(
+                    f"market_order rejected (code={response.code}, message={getattr(response, 'message', '')})"
+                )
+            self.logger.info(
+                "Submitted market order (reduce_only=%s) response_code=%s tx_hash=%s",
+                reduce_only,
+                getattr(response, "code", None),
+                getattr(response, "tx_hash", None),
+            )
+            return True
+        except Exception as exc:
+            self.logger.error(
+                "Market order failed (reduce_only=%s amount=%.6f): %s",
+                reduce_only,
+                amount,
+                exc,
+                exc_info=True,
+            )
+            return False
 
     async def wait_until_flat(self, timeout: float = 15.0) -> None:
         if self.dry_run or not self.lighter:
             return
         deadline = time.time() + timeout
         last_state: Optional[Tuple[float, float]] = None
+
+        # Get minimum base amount to consider dust positions
+        constraints = self.market_constraints
+        min_base_amount = constraints.min_base_amount if constraints else 0.0
+
         while time.time() < deadline:
             long_qty, short_qty = await self.fetch_positions()
             state = (long_qty, short_qty)
-            if long_qty <= 0 and short_qty <= 0:
+
+            # Consider positions "flat" if they're below minimum trading amounts
+            significant_long = long_qty >= min_base_amount
+            significant_short = short_qty >= min_base_amount
+
+            if not significant_long and not significant_short:
+                if long_qty > 0 or short_qty > 0:
+                    self.logger.info(
+                        "Positions considered flat with only dust remaining (long=%.6f, short=%.6f)",
+                        long_qty,
+                        short_qty,
+                    )
                 return
+
             if last_state != state:
                 self.logger.info(
                     "Waiting for positions to flatten (long=%.6f, short=%.6f)",
@@ -1010,12 +1269,24 @@ class DynamicVolatilityGridReaper:
                 )
                 last_state = state
             await asyncio.sleep(0.75)
-        if last_state and any(q > 0 for q in last_state):
-            self.logger.warning(
-                "Timed out waiting for positions to flatten (long=%.6f, short=%.6f)",
-                last_state[0],
-                last_state[1],
-            )
+
+        if last_state:
+            long_qty, short_qty = last_state
+            significant_long = long_qty >= min_base_amount
+            significant_short = short_qty >= min_base_amount
+
+            if significant_long or significant_short:
+                self.logger.warning(
+                    "Timed out waiting for significant positions to flatten (long=%.6f, short=%.6f)",
+                    long_qty,
+                    short_qty,
+                )
+            else:
+                self.logger.info(
+                    "Timed out but only dust positions remain (long=%.6f, short=%.6f)",
+                    long_qty,
+                    short_qty,
+                )
 
     async def fetch_positions(self) -> Tuple[float, float]:
         if self.dry_run:
@@ -1067,7 +1338,7 @@ class DynamicVolatilityGridReaper:
             return
 
         equity = overview["equity"]
-        realized = overview["realized"]
+        raw_realized = overview.get("realized", 0.0)
         unrealized = overview["unrealized"]
 
         if self.performance_baseline_equity is None and equity > 0:
@@ -1075,6 +1346,17 @@ class DynamicVolatilityGridReaper:
             await self.persist_baseline(equity)
 
         baseline = self.performance_baseline_equity or equity
+        synthetic_realized = equity - baseline - unrealized
+
+        realized = raw_realized
+        if abs(realized) < 1e-6 and abs(synthetic_realized) > 1e-6:
+            realized = synthetic_realized
+            self.logger.debug(
+                "Using synthetic realized PnL derived from equity. raw=%.6f synthetic=%.6f",
+                raw_realized,
+                synthetic_realized,
+            )
+
         roi_pct = ((equity - baseline) / baseline * 100) if baseline else 0.0
 
         snapshot = PerformanceSnapshot(
@@ -1088,12 +1370,26 @@ class DynamicVolatilityGridReaper:
         self.performance_history.append(snapshot)
         self.last_performance_update = now
 
+        long_qty = 0.0
+        short_qty = 0.0
+        if not self.dry_run:
+            long_qty, short_qty = await self.fetch_positions()
+            if self.market_manager:
+                long_qty = self.market_manager.format_quantity(long_qty, self.symbol)  # type: ignore[arg-type]
+                short_qty = self.market_manager.format_quantity(short_qty, self.symbol)  # type: ignore[arg-type]
+
+        # Update cached positions for risk management
+        self._last_long_position = long_qty
+        self._last_short_position = short_qty
+
         self.logger.info(
-            "Performance snapshot: equity=%.2f roi=%.2f%% realized=%.2f unrealized=%.2f",
+            "Performance snapshot: equity=%.2f roi=%.2f%% realized=%.2f unrealized=%.2f long=%.6f short=%.6f",
             snapshot.total_equity,
             snapshot.roi_pct,
             snapshot.realized_pnl,
             snapshot.unrealized_pnl,
+            long_qty,
+            short_qty,
         )
 
         await self.persist_performance_snapshot(snapshot, baseline)
@@ -1130,11 +1426,17 @@ class DynamicVolatilityGridReaper:
 
         positions = account.get("positions", [])
         unrealized = 0.0
+        position_realized = 0.0
         for position in positions:
             try:
                 unrealized += float(position.get("unrealized_pnl", 0.0))
+                if position.get("realized_pnl") is not None:
+                    position_realized += float(position.get("realized_pnl", 0.0))
             except (TypeError, ValueError):
                 continue
+
+        if abs(realized) < abs(position_realized):
+            realized = position_realized
 
         return {
             "equity": equity,
@@ -1224,15 +1526,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbol", default="BTC", help="Trading symbol (default: BTC)")
     parser.add_argument("--dry-run", action="store_true", help="Run without sending live orders")
     parser.add_argument("--indicator-period", type=int, default=14, help="ADX/ATR period (default: 14)")
-    parser.add_argument("--adx-threshold", type=float, default=25.0, help="ADX regime threshold")
-    parser.add_argument("--atr-multiplier", type=float, default=0.2, help="Grid spacing multiplier applied to ATR")
-    parser.add_argument("--grid-layers", type=int, default=5, help="Grid layers per side around the midpoint")
+    parser.add_argument("--adx-threshold", type=float, default=20.0, help="ADX regime threshold (lowered from 25 for earlier trend detection)")
+    parser.add_argument("--atr-multiplier", type=float, default=0.3, help="Grid spacing multiplier applied to ATR (increased from 0.2 for wider spacing)")
+    parser.add_argument("--grid-layers", type=int, default=3, help="Grid layers per side around the midpoint (reduced from 5 to limit exposure)")
     parser.add_argument("--total-notional", type=float, default=1000.0, help="Total quote capital to deploy across grid")
     parser.add_argument("--range-lookback", type=int, default=120, help="Candles used to detect price channel bounds")
     parser.add_argument("--indicator-interval", type=int, default=60, help="Seconds between indicator refreshes")
     parser.add_argument("--order-sync-interval", type=int, default=15, help="Seconds between order reconciliation attempts")
-    parser.add_argument("--stop-buffer", type=float, default=1.5, help="Multiplier applied to spacing for stop distance")
-    parser.add_argument("--min-grid-spacing-pct", type=float, default=0.001, help="Minimum grid spacing as %% of midpoint price")
+    parser.add_argument("--stop-buffer", type=float, default=2.0, help="Multiplier applied to spacing for stop distance (increased from 1.5 for safer stop)")
+    parser.add_argument("--min-grid-spacing-pct", type=float, default=0.002, help="Minimum grid spacing as %% of midpoint price (doubled for wider spacing)")
     parser.add_argument("--candle-lookback", type=int, default=200, help="Total candles requested each refresh")
     parser.add_argument("--reduce-only-exits", action="store_true", help="Submit sell orders as reduce-only")
     parser.add_argument("--performance-interval", type=int, default=120, help="Seconds between performance snapshots (0 disables tracking)")
@@ -1243,14 +1545,21 @@ def parse_args() -> argparse.Namespace:
         help="Path to SQLite database storing performance snapshots (empty string disables persistence)",
     )
     parser.add_argument("--enable-adaptive", action="store_true", default=True, help="Enable adaptive grid parameters based on volatility")
-    parser.add_argument("--adaptive-low-vol", type=float, default=0.001, help="ATR/mid threshold considered low volatility")
-    parser.add_argument("--adaptive-high-vol", type=float, default=0.01, help="ATR/mid threshold considered high volatility")
-    parser.add_argument("--adaptive-multiplier-min", type=float, default=0.15, help="Minimum ATR multiplier when volatility is low")
-    parser.add_argument("--adaptive-multiplier-max", type=float, default=0.4, help="Maximum ATR multiplier when volatility is high")
-    parser.add_argument("--adaptive-layers-min", type=int, default=3, help="Minimum grid layers when volatility is high")
-    parser.add_argument("--adaptive-layers-max", type=int, default=8, help="Maximum grid layers when volatility is low")
+    parser.add_argument("--adaptive-low-vol", type=float, default=0.002, help="ATR/mid threshold considered low volatility (doubled for more conservative bounds)")
+    parser.add_argument("--adaptive-high-vol", type=float, default=0.015, help="ATR/mid threshold considered high volatility (increased for more conservative bounds)")
+    parser.add_argument("--adaptive-multiplier-min", type=float, default=0.25, help="Minimum ATR multiplier when volatility is low (increased from 0.15)")
+    parser.add_argument("--adaptive-multiplier-max", type=float, default=0.5, help="Maximum ATR multiplier when volatility is high (increased from 0.4)")
+    parser.add_argument("--adaptive-layers-min", type=int, default=2, help="Minimum grid layers when volatility is high (reduced from 3)")
+    parser.add_argument("--adaptive-layers-max", type=int, default=4, help="Maximum grid layers when volatility is low (reduced from 8)")
     parser.add_argument("--adaptive-adx-min", type=float, default=20.0, help="Minimum ADX threshold when volatility is high")
     parser.add_argument("--adaptive-adx-max", type=float, default=30.0, help="Maximum ADX threshold when volatility is low")
+    parser.add_argument(
+        "--trend-exit-mode",
+        choices=["pause", "cancel", "flatten"],
+        default="cancel",
+        help="How to manage existing orders when ADX signals a trend (cancel: remove orders to reduce exposure, pause: keep existing grid, flatten: cancel and close positions)",
+    )
+    parser.add_argument("--max-position-ratio", type=float, default=0.4, help="Maximum position value as ratio of total notional (0.4 = 40%% max exposure)")
     return parser.parse_args()
 
 
@@ -1283,6 +1592,8 @@ async def async_main() -> None:
         adaptive_adx_min=args.adaptive_adx_min,
         adaptive_adx_max=args.adaptive_adx_max,
         performance_db=args.performance_db or None,
+        trend_exit_mode=args.trend_exit_mode,
+        max_position_ratio=args.max_position_ratio,
     )
     try:
         await strategy.run()

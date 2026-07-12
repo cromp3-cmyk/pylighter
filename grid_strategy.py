@@ -641,93 +641,92 @@ class GridBot:
         except Exception as e:
             logger.error(f"空头订单失败: {e}")
 
-    async def check_and_reduce_positions(self):
-        """
-        检查持仓并减少库存风险 (对齐 Binance 参考实现 line 732-754)
-        """
-        try:
-            position_threshold = self.get_position_threshold()
-            # 设置持仓阈值 (对齐 Binance local_position_threshold = POSITION_THRESHOLD * 0.8)
-            local_threshold = position_threshold * INVENTORY_REDUCTION_RATIO
-            reduce_quantity = position_threshold * 0.1  # 平仓数量
+async def check_and_reduce_positions(self):
+    """
+    检查持仓并减少库存风险 - NUR LONG (Short-Teil deaktiviert)
+    """
+    try:
+        position_threshold = self.get_position_threshold()
+        local_threshold = position_threshold * INVENTORY_REDUCTION_RATIO
+        reduce_quantity = position_threshold * 0.1
 
-            # 双向持仓过大风险控制 (对齐 Binance line 741-753)
-            if (self.long_position >= local_threshold and
-                self.short_position >= local_threshold):
+        # Nur Long-Risiko prüfen
+        if self.long_position >= local_threshold:
+            logger.warning(f"⚠️ Long-Position zu groß: {self.long_position}")
+            logger.info(f"🔄 Starte Risikoreduktion, Threshold={local_threshold}, Menge={reduce_quantity}")
 
-                logger.warning(f"⚠️ 双向持仓风险: 多头={self.long_position}, 空头={self.short_position}")
-                logger.info(f"🔄 启动库存风险控制，阈值={local_threshold}, 平仓量={reduce_quantity}")
-
-                if self.dry_run:
-                    logger.info(f"🔄 DRY RUN - 双向市价平仓: {reduce_quantity}")
-                    self.long_position = max(0, self.long_position - reduce_quantity)
-                    self.short_position = max(0, self.short_position - reduce_quantity)
-                    logger.info(f"✅ 模拟双向平仓完成，剩余: 多头={self.long_position}, 空头={self.short_position}")
-                else:
-                    # 实际执行市价平仓 (对齐 Binance)
-                    logger.info("⚡ 实盘模式：执行双向市价平仓")
-
-                    # 平多头持仓 (卖出)
-                    if self.long_position > 0:
-                        sell_result = await self.place_market_order('sell', reduce_quantity, 'long')
-                        if sell_result:
-                            logger.info(f"✅ 多头平仓成功: {reduce_quantity}")
-                            self.long_position = max(0, self.long_position - reduce_quantity)
-                        else:
-                            logger.error("❌ 多头平仓失败")
-
-                    # 平空头持仓 (买入)
-                    if self.short_position > 0:
-                        buy_result = await self.place_market_order('buy', reduce_quantity, 'short')
-                        if buy_result:
-                            logger.info(f"✅ 空头平仓成功: {reduce_quantity}")
-                            self.short_position = max(0, self.short_position - reduce_quantity)
-                        else:
-                            logger.error("❌ 空头平仓失败")
-
-                    logger.info(f"📊 平仓后持仓: 多头={self.long_position}, 空头={self.short_position}")
-
-        except Exception as e:
-            logger.error(f"持仓风险控制失败: {e}")
-
-    async def adjust_grid_strategy(self):
-        """网格策略主逻辑 (对齐 Binance 参考实现)"""
-        try:
-            # 检查价格是否有效
-            if self.latest_price <= 0:
-                logger.debug("等待有效价格...")
-                return
-
-            # 检查是否需要更新订单 (基于价格阈值)
-            if not self.should_update_orders(self.latest_price):
-                return
-
-            logger.debug(f"价格变动达到阈值，执行网格调整 (${self.latest_price:.6f})")
-
-            # ====== 双向持仓风控检查 (对齐 Binance line 776) ======
-            await self.check_and_reduce_positions()
-
-            # ====== 多头策略逻辑 (对齐 Binance line 780-793) ======
-            if self.long_position == 0:
-                logger.info("🟢 初始化多头订单")
-                await self.initialize_long_orders()
+            if self.dry_run:
+                logger.info(f"🔄 DRY RUN - Long-Reduktion: {reduce_quantity}")
+                self.long_position = max(0, self.long_position - reduce_quantity)
             else:
-                logger.debug(f"🔄 调整多头网格 (持仓={self.long_position})")
-                await self.place_long_orders(self.latest_price)
+                if self.long_position > 0:
+                    sell_result = await self.place_market_order('sell', reduce_quantity, 'long')
+                    if sell_result:
+                        logger.info(f"✅ Long-Reduktion erfolgreich: {reduce_quantity}")
+                        self.long_position = max(0, self.long_position - reduce_quantity)
+                    else:
+                        logger.error("❌ Long-Reduktion fehlgeschlagen")
 
-            # ====== 空头策略逻辑 (对齐 Binance line 795-808) ======
-            if self.short_position == 0:
-                logger.info("🔴 初始化空头订单")
-                await self.initialize_short_orders()
-            else:
-                logger.debug(f"🔄 调整空头网格 (持仓={self.short_position})")
-                await self.place_short_orders(self.latest_price)
+        # Short-Teil komplett deaktiviert
+        # if self.short_position >= local_threshold:
+        #     ... Short-Logik ...
 
-            # ====== 统一更新价格基准 (对齐 Binance 逻辑) ======
-            self.update_last_order_price()
+        logger.debug(f"📊 Nach Risikokontrolle: Long={self.long_position}")
 
-        except Exception as e:
-            logger.error(f"网格策略执行失败: {e}")
+    except Exception as e:
+        logger.error(f"持仓风险控制失败: {e}")
+
+
+            async def adjust_grid_strategy(self):
+    """网格策略主逻辑 - NUR LONG (Shorts deaktiviert)"""
+    try:
+        # 检查价格是否有效
+        if self.latest_price <= 0:
+            logger.debug("等待有效价格...")
+            return
+
+        # 检查是否需要更新订单 (基于价格阈值)
+        if not self.should_update_orders(self.latest_price):
+            return
+
+        logger.debug(f"价格变动达到阈值，执行网格调整 (${self.latest_price:.6f})")
+
+        # ====== 双向持仓风控检查 (nur für Long) ======
+        # Short-Teil in check_and_reduce_positions wird ignoriert
+        await self.check_and_reduce_positions()
+
+        # ====== 多头策略逻辑 (AKTIV) ======
+        if self.long_position == 0:
+            logger.info("🟢 初始化多头订单")
+            await self.initialize_long_orders()
+        else:
+            logger.debug(f"🔄 调整多头网格 (持仓={self.long_position})")
+            await self.place_long_orders(self.latest_price)
+
+        # ====== 空头策略逻辑 (DEAKTIVIERT - NUR LONG) ======
+        # Short-Strategie komplett ausgeschaltet
+        # if self.short_position == 0:
+        #     logger.info("🔴 初始化空头订单")
+        #     await self.initialize_short_orders()
+        # else:
+        #     logger.debug(f"🔄 调整空头网格 (持仓={self.short_position})")
+        #     await self.place_short_orders(self.latest_price)
+        
+        # Log für Nur Long Modus (nur alle 10 Durchläufe)
+        if hasattr(self, '_only_long_log_counter'):
+            self._only_long_log_counter += 1
+        else:
+            self._only_long_log_counter = 0
+        
+        if self._only_long_log_counter % 10 == 0:
+            logger.debug("⏸️ Nur Long-Modus aktiv (Shorts deaktiviert)")
+
+        # ====== 统一更新价格基准 ======
+        self.update_last_order_price()
+
+    except Exception as e:
+        logger.error(f"网格策略执行失败: {e}")
+            
 
     async def graceful_shutdown(self):
         """优雅关闭 (对齐 Binance)"""

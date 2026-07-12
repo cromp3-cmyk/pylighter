@@ -641,92 +641,89 @@ class GridBot:
         except Exception as e:
             logger.error(f"空头订单失败: {e}")
 
-async def check_and_reduce_positions(self):
-    """
-    检查持仓并减少库存风险 - NUR LONG (Short-Teil deaktiviert)
-    """
-    try:
-        position_threshold = self.get_position_threshold()
-        local_threshold = position_threshold * INVENTORY_REDUCTION_RATIO
-        reduce_quantity = position_threshold * 0.1
+    async def check_and_reduce_positions(self):
+        """
+        检查持仓并减少库存风险 - NUR LONG (Short-Teil deaktiviert)
+        """
+        try:
+            position_threshold = self.get_position_threshold()
+            local_threshold = position_threshold * INVENTORY_REDUCTION_RATIO
+            reduce_quantity = position_threshold * 0.1
 
-        # Nur Long-Risiko prüfen
-        if self.long_position >= local_threshold:
-            logger.warning(f"⚠️ Long-Position zu groß: {self.long_position}")
-            logger.info(f"🔄 Starte Risikoreduktion, Threshold={local_threshold}, Menge={reduce_quantity}")
+            # Nur Long-Risiko prüfen
+            if self.long_position >= local_threshold:
+                logger.warning(f"⚠️ Long-Position zu groß: {self.long_position}")
+                logger.info(f"🔄 Starte Risikoreduktion, Threshold={local_threshold}, Menge={reduce_quantity}")
 
-            if self.dry_run:
-                logger.info(f"🔄 DRY RUN - Long-Reduktion: {reduce_quantity}")
-                self.long_position = max(0, self.long_position - reduce_quantity)
+                if self.dry_run:
+                    logger.info(f"🔄 DRY RUN - Long-Reduktion: {reduce_quantity}")
+                    self.long_position = max(0, self.long_position - reduce_quantity)
+                else:
+                    if self.long_position > 0:
+                        sell_result = await self.place_market_order('sell', reduce_quantity, 'long')
+                        if sell_result:
+                            logger.info(f"✅ Long-Reduktion erfolgreich: {reduce_quantity}")
+                            self.long_position = max(0, self.long_position - reduce_quantity)
+                        else:
+                            logger.error("❌ Long-Reduktion fehlgeschlagen")
+
+            # Short-Teil komplett deaktiviert
+            # if self.short_position >= local_threshold:
+            #     ... Short-Logik ...
+
+            logger.debug(f"📊 Nach Risikokontrolle: Long={self.long_position}")
+
+        except Exception as e:
+            logger.error(f"持仓风险控制失败: {e}")
+
+    async def adjust_grid_strategy(self):
+        """网格策略主逻辑 - NUR LONG (Shorts deaktiviert)"""
+        try:
+            # 检查价格是否有效
+            if self.latest_price <= 0:
+                logger.debug("等待有效价格...")
+                return
+
+            # 检查是否需要更新订单 (基于价格阈值)
+            if not self.should_update_orders(self.latest_price):
+                return
+
+            logger.debug(f"价格变动达到阈值，执行网格调整 (${self.latest_price:.6f})")
+
+            # ====== 双向持仓风控检查 (nur für Long) ======
+            await self.check_and_reduce_positions()
+
+            # ====== 多头策略逻辑 (AKTIV) ======
+            if self.long_position == 0:
+                logger.info("🟢 初始化多头订单")
+                await self.initialize_long_orders()
             else:
-                if self.long_position > 0:
-                    sell_result = await self.place_market_order('sell', reduce_quantity, 'long')
-                    if sell_result:
-                        logger.info(f"✅ Long-Reduktion erfolgreich: {reduce_quantity}")
-                        self.long_position = max(0, self.long_position - reduce_quantity)
-                    else:
-                        logger.error("❌ Long-Reduktion fehlgeschlagen")
+                logger.debug(f"🔄 调整多头网格 (持仓={self.long_position})")
+                await self.place_long_orders(self.latest_price)
 
-        # Short-Teil komplett deaktiviert
-        # if self.short_position >= local_threshold:
-        #     ... Short-Logik ...
+            # ====== 空头策略逻辑 (DEAKTIVIERT - NUR LONG) ======
+            # Short-Strategie komplett ausgeschaltet
+            # if self.short_position == 0:
+            #     logger.info("🔴 初始化空头订单")
+            #     await self.initialize_short_orders()
+            # else:
+            #     logger.debug(f"🔄 调整空头网格 (持仓={self.short_position})")
+            #     await self.place_short_orders(self.latest_price)
 
-        logger.debug(f"📊 Nach Risikokontrolle: Long={self.long_position}")
+            # Log für Nur Long Modus (nur alle 10 Durchläufe)
+            if hasattr(self, '_only_long_log_counter'):
+                self._only_long_log_counter += 1
+            else:
+                self._only_long_log_counter = 0
 
-    except Exception as e:
-        logger.error(f"持仓风险控制失败: {e}")
+            if self._only_long_log_counter % 10 == 0:
+                logger.debug("⏸️ Nur Long-Modus aktiv (Shorts deaktiviert)")
 
+            # ====== 统一更新价格基准 ======
+            self.update_last_order_price()
 
-            async def adjust_grid_strategy(self):
-    """网格策略主逻辑 - NUR LONG (Shorts deaktiviert)"""
-    try:
-        # 检查价格是否有效
-        if self.latest_price <= 0:
-            logger.debug("等待有效价格...")
-            return
-
-        # 检查是否需要更新订单 (基于价格阈值)
-        if not self.should_update_orders(self.latest_price):
-            return
-
-        logger.debug(f"价格变动达到阈值，执行网格调整 (${self.latest_price:.6f})")
-
-        # ====== 双向持仓风控检查 (nur für Long) ======
-        # Short-Teil in check_and_reduce_positions wird ignoriert
-        await self.check_and_reduce_positions()
-
-        # ====== 多头策略逻辑 (AKTIV) ======
-        if self.long_position == 0:
-            logger.info("🟢 初始化多头订单")
-            await self.initialize_long_orders()
-        else:
-            logger.debug(f"🔄 调整多头网格 (持仓={self.long_position})")
-            await self.place_long_orders(self.latest_price)
-
-        # ====== 空头策略逻辑 (DEAKTIVIERT - NUR LONG) ======
-        # Short-Strategie komplett ausgeschaltet
-        # if self.short_position == 0:
-        #     logger.info("🔴 初始化空头订单")
-        #     await self.initialize_short_orders()
-        # else:
-        #     logger.debug(f"🔄 调整空头网格 (持仓={self.short_position})")
-        #     await self.place_short_orders(self.latest_price)
-        
-        # Log für Nur Long Modus (nur alle 10 Durchläufe)
-        if hasattr(self, '_only_long_log_counter'):
-            self._only_long_log_counter += 1
-        else:
-            self._only_long_log_counter = 0
-        
-        if self._only_long_log_counter % 10 == 0:
-            logger.debug("⏸️ Nur Long-Modus aktiv (Shorts deaktiviert)")
-
-        # ====== 统一更新价格基准 ======
-        self.update_last_order_price()
-
-    except Exception as e:
-        logger.error(f"网格策略执行失败: {e}")
-            
+        except Exception as e:
+            logger.error(f"网格策略执行失败: {e}")
 
     async def graceful_shutdown(self):
         """优雅关闭 (对齐 Binance)"""

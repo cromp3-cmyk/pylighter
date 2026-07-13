@@ -440,7 +440,7 @@ async def main():
                         help=f'最大订单数 (默认: {MAX_ORDERS})')
     parser.add_argument('--grid-spacing', type=float, default=GRID_SPACING,
                         help=f'Nachkauf-Abstand (默认: {GRID_SPACING*100:.1f}%)')
-    parser.add_argument('--take-profit', type=float, default=TAKE_PROFIT_PERECENT,
+    parser.add_argument('--take-profit', type=float, default=TAKE_PROFIT_PERCENT,
                         help=f'Gewinnziel (默认: {TAKE_PROFIT_PERCENT*100:.1f}%)')
     parser.add_argument('--order-amount', type=float, default=INITIAL_QUANTITY,
                         help=f'Order-Größe USD (默认: ${INITIAL_QUANTITY})')

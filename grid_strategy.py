@@ -310,64 +310,54 @@ class DCAGridBot:
             if self.latest_price <= 0:
                 return
 
-            # 1. Prüfe, ob Grid-Orders existieren
+            # ====== 1. Prüfe, ob bereits eine Order existiert ======
             tracker = self.order_manager.get_tracker(self.symbol)
             counts = tracker.get_order_counts()
+            
+            # 🔥 WICHTIG: Wenn bereits eine Order existiert → nichts tun!
+            if counts['total_active'] > 0:
+                logger.debug(f"⏸️ Order existiert bereits ({counts['total_active']} aktiv) → warte...")
+                return
 
-            # 2. Berechne Zielpreise
-            buy_price = self.latest_price * (1 - self.grid_spacing)  # 0.5% unter aktuell
-            sell_price = self.latest_price * (1 + self.take_profit_percent)  # 1% über aktuell
+            # ====== 2. Position und Durchschnittspreis aktualisieren ======
+            self.long_position, self.avg_entry_price = await self.get_positions()
 
-            # 3. Prüfe, ob eine Position existiert
+            # ====== 3. Berechne Zielpreise ======
+            buy_price = self.latest_price * (1 - self.grid_spacing)
+            sell_price = self.avg_entry_price * (1 + self.take_profit_percent) if self.avg_entry_price > 0 else 0
+
+            # ====== 4. Keine Position → Kauf ======
             if self.long_position == 0:
-                # Keine Position → Kauf bei -0.5%
                 logger.info(f"🟢 Keine Position - Kaufe bei ${buy_price:.6f}")
                 await self.place_buy_order(buy_price, self.initial_quantity_per_order)
                 return
 
-            # 4. Position existiert → Prüfe Gewinnziel
+            # ====== 5. Position existiert → Prüfe Gewinn ======
             if self.avg_entry_price > 0:
                 current_profit_pct = (self.latest_price - self.avg_entry_price) / self.avg_entry_price
 
-                # 4a. Wenn ≥ 1% Gewinn → Verkaufen
+                # 5a. Gewinnziel erreicht → Verkaufen
                 if current_profit_pct >= self.take_profit_percent:
-                    logger.info(f"✅ {current_profit_pct*100:.2f}% Gewinn erreicht! Verkaufe bei ${self.latest_price:.6f}")
+                    logger.info(f"✅ {current_profit_pct*100:.2f}% Gewinn! Verkaufe bei ${self.latest_price:.6f}")
                     await self.place_sell_order(self.latest_price, self.long_position)
-
-                    # Position zurücksetzen
                     self.long_position = 0
                     self.avg_entry_price = 0
                     self.total_trades += 1
                     self.total_sells += 1
-
-                    # Neue Kauf-Order bei -0.5%
-                    buy_price = self.latest_price * (1 - self.grid_spacing)
-                    logger.info(f"🟢 Neue Kauf-Order bei ${buy_price:.6f}")
-                    await self.place_buy_order(buy_price, self.initial_quantity_per_order)
                     return
 
-                # 4b. Wenn ≤ 0.5% gefallen → Nachkaufen
+                # 5b. Nachkauf-Bedingung → Nachkaufen
                 if current_profit_pct <= -self.grid_spacing:
                     logger.info(f"📉 {abs(current_profit_pct)*100:.2f}% gefallen - Kaufe nach bei ${buy_price:.6f}")
                     await self.place_buy_order(buy_price, self.initial_quantity_per_order)
                     self.total_buys += 1
                     return
 
-            # 5. Grid-Orders setzen (falls nicht vorhanden)
-            if counts['sell_orders'] == 0 and counts['buy_orders'] == 0:
-                # Keine Orders → Neue Orders setzen
-                logger.info(f"🔄 Setze Grid-Orders: Buy @ ${buy_price:.6f}, Sell @ ${sell_price:.6f}")
-
-                # Bei fallendem Preis kaufen
-                if self.long_position == 0:
-                    await self.place_buy_order(buy_price, self.initial_quantity_per_order)
-                else:
-                    # Bei steigendem Preis verkaufen
+            # ====== 6. Keine Orders → Neue Orders setzen ======
+            if counts['total_active'] == 0:
+                if self.long_position > 0 and sell_price > 0:
                     await self.place_sell_order(sell_price, self.long_position)
-
-                    # Zusätzliche Kauf-Order für Nachkauf
-                    buy_price = self.latest_price * (1 - self.grid_spacing)
-                    await self.place_buy_order(buy_price, self.initial_quantity_per_order)
+                await self.place_buy_order(buy_price, self.initial_quantity_per_order)
 
             self.update_last_order_price()
 
@@ -450,7 +440,7 @@ async def main():
                         help=f'最大订单数 (默认: {MAX_ORDERS})')
     parser.add_argument('--grid-spacing', type=float, default=GRID_SPACING,
                         help=f'Nachkauf-Abstand (默认: {GRID_SPACING*100:.1f}%)')
-    parser.add_argument('--take-profit', type=float, default=TAKE_PROFIT_PERCENT,
+    parser.add_argument('--take-profit', type=float, default=TAKE_PROFIT_PERECENT,
                         help=f'Gewinnziel (默认: {TAKE_PROFIT_PERCENT*100:.1f}%)')
     parser.add_argument('--order-amount', type=float, default=INITIAL_QUANTITY,
                         help=f'Order-Größe USD (默认: ${INITIAL_QUANTITY})')

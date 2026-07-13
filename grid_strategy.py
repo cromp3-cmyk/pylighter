@@ -605,7 +605,7 @@ class GridBot:
             logger.error(f"持仓风险控制失败: {e}")
 
     async def adjust_grid_strategy(self):
-        """网格策略主逻辑 - NUR LONG (Intelligente Order-Aktualisierung)"""
+        """网格策略主逻辑 - NUR LONG (Nur bei Bedarf aktualisieren)"""
         try:
             if self.latest_price <= 0:
                 logger.debug("等待有效价格...")
@@ -615,18 +615,26 @@ class GridBot:
             tracker = self.order_manager.get_tracker(self.symbol)
             counts = tracker.get_order_counts()
             
-            # Wenn beide Orders existieren, nur bei Preisänderung aktualisieren
+            # Wenn beide Orders existieren, NUR bei Preisänderung aktualisieren
             if counts['sell_orders'] > 0 and counts['buy_orders'] > 0:
-                # Normale Preis-Threshold-Prüfung
-                if not self.should_update_orders(self.latest_price):
-                    return
+                # Prüfe Preisänderung
+                if self.last_order_price == 0:
+                    # Erste Preisaktualisierung → Orders setzen
+                    pass
+                else:
+                    # Preisänderung berechnen
+                    price_change_pct = abs(self.latest_price - self.last_order_price) / self.last_order_price
+                    if price_change_pct < self.price_update_threshold:
+                        # Keine ausreichende Preisänderung → nichts tun
+                        logger.debug(f"⏸️ Preisänderung zu gering: {price_change_pct:.4f} < {self.price_update_threshold:.4f}")
+                        return
             
-            # Wenn eine Order fehlt, sofort neu setzen
-            logger.debug(f"Führe Grid-Anpassung aus (${self.latest_price:.6f})")
+            # Wenn eine Order fehlt ODER Preisänderung ausreichend ist, neu setzen
+            logger.debug(f"🔄 Setze Grid-Orders (${self.latest_price:.6f})")
 
             await self.check_and_reduce_positions()
 
-            # ====== 多头策略逻辑 - IMMER AUSFÜHREN ======
+            # ====== 多头策略逻辑 ======
             if self.long_position == 0:
                 logger.info("🟢 Keine Position - starte Grid direkt")
                 await self.place_long_orders(self.latest_price)

@@ -45,7 +45,7 @@ ORDER_FIRST_TIME = 2          # 首单间隔2秒 (提高响应速度)
 # 新增优化参数 - 平衡效率与持仓规模
 MAX_ORDERS_PER_SIDE = 20        # 单边最大订单数 (减少复杂度，集中资金)
 ORDER_REFRESH_INTERVAL = 20    # 订单刷新间隔(秒) (降低频率，减少手续费)
-PRICE_UPDATE_THRESHOLD = 0.005  # 价格变动阈值 0.5% (减少噪音交易)
+PRICE_UPDATE_THRESHOLD = 0.0002  # 价格变动阈值 0.02% (减少噪音交易)
 
 # 🚀 动态止盈参数 (对齐 Binance 参考实现)
 DYNAMIC_PROFIT_MIN = 0.005    # 最小止盈率 0.5%
@@ -116,13 +116,13 @@ class GridBot:
         # 2. 初始化 SDK 工具
         self.market_manager = MarketDataManager(self.lighter)
         self.order_manager = OrderSyncManager(self.lighter)
-        self.batch_manager = BatchOrderManager(self.lighter, dry_run=self.dry_run)
+        self.batch_manager = BatchOrderManager(self.lighter, dry_run=self.dry_run)  # 传递 dry_run 参数
 
         # 3. 获取市场约束
         constraints = await self.market_manager.get_market_constraints(self.symbol)
         logger.info(f"✅ {self.symbol} 约束: 最小订单=${constraints.min_quote_amount}")
 
-        # 4. 启动状态分析和账户信息获取
+        # 4. 启动状态分析和账户信息获取 (一次性完成，减少重复API调用)
         await self.analyze_startup_state()
 
         # 6. 初始化价格 WebSocket
@@ -135,6 +135,7 @@ class GridBot:
     async def get_account_stats(self) -> dict:
         """获取官方账户统计信息"""
         try:
+            # 使用官方 API 获取账户统计
             response = await self.lighter.account(by='l1_address')
 
             if not isinstance(response, dict) or response.get('code') != 200:
@@ -149,12 +150,14 @@ class GridBot:
             account = accounts[0]
             positions = account.get('positions', [])
 
+            # 查找当前交易对的持仓
             current_position = None
             for pos in positions:
                 if pos.get('symbol') == self.symbol:
                     current_position = pos
                     break
 
+            # 构建统计信息
             stats = {
                 'account_info': {
                     'index': account.get('account_index'),
@@ -172,7 +175,7 @@ class GridBot:
                 stats['current_position'] = {
                     'symbol': current_position.get('symbol'),
                     'position': float(current_position.get('position', 0)),
-                    'sign': current_position.get('sign', 1),
+                    'sign': current_position.get('sign', 1),  # 添加 sign 字段
                     'position_value': float(current_position.get('position_value', 0)),
                     'avg_entry_price': float(current_position.get('avg_entry_price', 0)),
                     'unrealized_pnl': float(current_position.get('unrealized_pnl', 0)),
@@ -181,8 +184,9 @@ class GridBot:
                     'open_order_count': current_position.get('open_order_count', 0),
                 }
 
+            # 所有持仓概览
             for pos in positions:
-                if float(pos.get('position', 0)) != 0:
+                if float(pos.get('position', 0)) != 0:  # 只显示非零持仓
                     stats['all_positions'].append({
                         'symbol': pos.get('symbol'),
                         'position': float(pos.get('position', 0)),
@@ -239,30 +243,34 @@ class GridBot:
         logger.info("=" * 50)
 
     async def analyze_startup_state(self):
-        """启动状态分析 - 一次性获取所有账户信息"""
+        """启动状态分析 (对齐 Binance) - 一次性获取所有账户信息"""
         logger.info("📊 分析启动状态...")
 
+        # 一次性获取完整账户信息 (减少重复API调用)
         try:
             stats = await self.get_account_stats()
             account_info = stats.get('account_info', {})
 
+            # 设置账户总价值
             self.total_asset_value = account_info.get('total_asset_value', 1000.0)
             logger.info(f"✅ 账户总价值: ${self.total_asset_value:.2f}")
 
+            # 启动时显示一次统计信息并从中提取持仓数据 (避免重复调用)
             self.print_account_stats(stats)
 
+            # 从统计信息中提取持仓数据 (使用 position 和 sign 字段)
             current_position = stats.get('current_position', {})
             if current_position and current_position.get('symbol') == self.symbol:
                 position_value = float(current_position.get('position', 0))
-                sign_value = current_position.get('sign', 1)
+                sign_value = current_position.get('sign', 1)  # sign: 1=多头, -1=空头
 
-                if position_value != 0:
+                if position_value != 0:  # 有持仓
                     if sign_value > 0:
-                        self.long_position = abs(position_value)
+                        self.long_position = abs(position_value)  # 多头持仓
                         self.short_position = 0
                     else:
                         self.long_position = 0
-                        self.short_position = abs(position_value)
+                        self.short_position = abs(position_value)  # 空头持仓
                 else:
                     self.long_position = 0
                     self.short_position = 0
@@ -273,6 +281,7 @@ class GridBot:
         except Exception as e:
             logger.warning(f"获取账户信息失败: {e}")
             self.total_asset_value = 1000.0
+            # 后备方案：调用 get_positions 方法
             self.long_position, self.short_position = await self.get_positions()
 
         logger.info(f"启动持仓: 多头={self.long_position}, 空头={self.short_position}")
@@ -280,6 +289,7 @@ class GridBot:
         if self.long_position > 0 or self.short_position > 0:
             logger.warning("⚠️ 检测到现有持仓! 网格策略将管理这些持仓")
 
+        # 同步订单状态
         await self.order_manager.sync_orders_from_api(self.symbol)
         tracker = self.order_manager.get_tracker(self.symbol)
         counts = tracker.get_order_counts()
@@ -291,6 +301,7 @@ class GridBot:
             return self.long_position, self.short_position
 
         try:
+            # 使用官方账户API获取实际持仓
             response = await self.lighter.account(by='l1_address')
 
             if not isinstance(response, dict) or response.get('code') != 200:
@@ -305,19 +316,20 @@ class GridBot:
             account = accounts[0]
             positions = account.get('positions', [])
 
+            # 查找当前交易对的持仓
             long_pos = 0
             short_pos = 0
 
             for pos in positions:
                 if pos.get('symbol') == self.symbol:
                     position_value = float(pos.get('position', 0))
-                    sign_value = pos.get('sign', 1)
+                    sign_value = pos.get('sign', 1)  # sign: 1=多头, -1=空头
 
-                    if position_value != 0:
+                    if position_value != 0:  # 有持仓
                         if sign_value > 0:
-                            long_pos = abs(position_value)
+                            long_pos = abs(position_value)  # 多头持仓
                         else:
-                            short_pos = abs(position_value)
+                            short_pos = abs(position_value)  # 空头持仓
                     break
 
             logger.debug(f"API持仓同步: {self.symbol} 多头={long_pos}, 空头={short_pos}")
@@ -325,10 +337,11 @@ class GridBot:
 
         except Exception as e:
             logger.error(f"获取持仓失败: {e}")
+            # 返回当前缓存的持仓数据
             return self.long_position, self.short_position
 
     def on_price_update(self, market_id: int, order_book: dict):
-        """价格更新回调"""
+        """价格更新回调 (使用 SDK WebSocket 管理器)"""
         try:
             bids = order_book.get('bids', [])
             asks = order_book.get('asks', [])
@@ -339,6 +352,7 @@ class GridBot:
                 old_price = self.latest_price
                 self.latest_price = (self.best_bid_price + self.best_ask_price) / 2
 
+                # 首次价格更新
                 if old_price == 0 and self.latest_price > 0:
                     self.update_initial_quantities()
 
@@ -346,8 +360,9 @@ class GridBot:
             logger.error(f"价格更新处理失败: {e}")
 
     def update_initial_quantities(self):
-        """更新初始数量"""
+        """更新初始数量 (对齐 Binance)"""
         if self.latest_price > 0:
+            # 使用 SDK 工具计算数量
             quantity, is_valid, msg = self.market_manager.calculate_quantity_for_quote_amount(
                 self.latest_price, self.initial_quantity, self.symbol
             )
@@ -359,12 +374,15 @@ class GridBot:
     def should_update_orders(self, new_price):
         """判断是否需要更新订单 (基于价格变动阈值)"""
         if self.last_order_price == 0:
+            # 首次价格更新，必须更新订单
             logger.info(f"🎯 首次价格更新: ${new_price:.6f}")
             return True
 
         if new_price <= 0:
+            # 无效价格，不更新
             return False
 
+        # 计算价格变动百分比
         price_change_pct = abs(new_price - self.last_order_price) / self.last_order_price
         should_update = price_change_pct >= self.price_update_threshold
 
@@ -377,25 +395,37 @@ class GridBot:
         return should_update
 
     def update_last_order_price(self):
-        """更新上次下单价格"""
+        """更新上次下单价格 (在实际下单后调用)"""
         self.last_order_price = self.latest_price
         logger.debug(f"更新订单基准价格: ${self.last_order_price:.6f}")
 
     def get_position_threshold(self):
-        """动态获取持仓阈值"""
+        """
+        动态获取持仓阈值 (基于账户总价值)
+
+        Returns:
+            float: 持仓阈值 (币种数量)
+        """
         try:
+            # 使用启动时获取的账户总价值
             account_value = self.total_asset_value
+
+            # 计算持仓阈值对应的币种数量
+            # 阈值 = 账户价值 * 比例 / 当前币价
             threshold_usd = account_value * POSITION_THRESHOLD_RATIO
             threshold_amount = threshold_usd / self.latest_price if self.latest_price > 0 else 1.0
+
             logger.debug(f"持仓阈值计算: 账户价值=${account_value:.2f}, 阈值=${threshold_usd:.2f}, {self.symbol}阈值={threshold_amount:.4f}")
             return threshold_amount
+
         except Exception as e:
             logger.error(f"计算持仓阈值失败: {e}")
+            # 使用固定阈值作为后备方案
             fallback_usd = 1000.0 * POSITION_THRESHOLD_RATIO
             return fallback_usd / self.latest_price if self.latest_price > 0 else 1.0
 
     def get_take_profit_quantity(self, position, side):
-        """调整止盈数量"""
+        """调整止盈数量 (对齐 Binance)"""
         base_quantity = self.long_initial_quantity if side == 'long' else self.short_initial_quantity
         position_threshold = self.get_position_threshold()
 
@@ -408,8 +438,9 @@ class GridBot:
             return base_quantity
 
     async def place_order_safe(self, side: str, price: float, quantity: float, position_type: str = 'long'):
-        """安全下单"""
+        """安全下单 (使用 SDK 工具)"""
         try:
+            # 使用市场管理器格式化
             formatted_price = self.market_manager.format_price(price, self.symbol)
             is_valid, formatted_quantity, msg = self.market_manager.validate_order_amount(
                 formatted_price, quantity, self.symbol
@@ -423,6 +454,7 @@ class GridBot:
                 logger.info(f"🔄 DRY RUN - {side.upper()}: {formatted_quantity} @ ${formatted_price:.6f}")
                 return "dry_run_order_id"
 
+            # 实际下单
             logger.info(f"📈 REAL - {side}: {formatted_quantity} {self.symbol} @ ${formatted_price:.6f}")
 
             if side == 'sell':
@@ -442,8 +474,16 @@ class GridBot:
             return None
 
     async def place_market_order(self, side: str, quantity: float, position_type: str = 'long'):
-        """下市价单 (用于库存风险控制)"""
+        """
+        下市价单 (用于库存风险控制)
+
+        Args:
+            side: 'buy' 或 'sell'
+            quantity: 数量
+            position_type: 'long' 或 'short' (用于日志)
+        """
         try:
+            # 验证数量
             is_valid, formatted_quantity, msg = self.market_manager.validate_order_amount(
                 self.latest_price, quantity, self.symbol
             )
@@ -461,6 +501,7 @@ class GridBot:
             if side == 'sell':
                 formatted_quantity = -abs(formatted_quantity)
 
+            # 使用市价单
             result = await self.lighter.market_order(
                 ticker=self.symbol,
                 amount=formatted_quantity
@@ -473,45 +514,57 @@ class GridBot:
             return None
 
     async def initialize_long_orders(self):
-        """初始化多头订单"""
+        """初始化多头订单 (对齐 Binance)"""
         if time.time() - self.last_long_order_time < ORDER_FIRST_TIME:
             return
 
+        # 撤销多头方向的订单 (对齐 Binance 参考策略)
         await self.batch_manager.cancel_orders_for_side_safe(self.symbol, 'long')
 
+        # 下多头开仓单
         order_id = await self.place_order_safe('buy', self.best_bid_price, self.long_initial_quantity, 'long')
         if order_id:
             logger.info(f"✅ 多头开仓单已下达")
             self.last_long_order_time = time.time()
 
     async def initialize_short_orders(self):
-        """初始化空头订单"""
+        """初始化空头订单 (对齐 Binance)"""
         if time.time() - self.last_short_order_time < ORDER_FIRST_TIME:
             return
 
+        # 撤销空头方向的订单 (对齐 Binance 参考策略)
         await self.batch_manager.cancel_orders_for_side_safe(self.symbol, 'short')
 
+        # 下空头开仓单
         order_id = await self.place_order_safe('sell', self.best_ask_price, self.short_initial_quantity, 'short')
         if order_id:
             logger.info(f"✅ 空头开仓单已下达")
             self.last_short_order_time = time.time()
 
     async def place_long_orders(self, latest_price):
-        """挂多头订单"""
+        """
+        挂多头订单 (对齐 Binance 参考实现 line 644-667)
+        """
         try:
             position_threshold = self.get_position_threshold()
             quantity = self.get_take_profit_quantity(self.long_position, 'long')
 
+            # 检查持仓是否超过阈值 (对齐 Binance line 651-656)
             if self.long_position > position_threshold:
                 logger.info(f"多头持仓过大 ({self.long_position})，进入装死模式")
+
+                # 检查是否已有止盈单 (对齐 Binance: if self.sell_long_orders <= 0)
                 tracker = self.order_manager.get_tracker(self.symbol)
                 counts = tracker.get_order_counts()
-                if counts['sell_orders'] <= 0:
+                if counts['sell_orders'] <= 0:  # 没有多头止盈单时才下新单
+                    # 装死模式：只下止盈单 (对齐 Binance)
                     if self.short_position > 0:
+                        # 动态止盈比例计算 (对齐 Binance line 654)
                         r = float((self.long_position / self.short_position) / 100 + 1)
                         exit_price = self.latest_price * r
                         logger.info(f"🔄 多头装死止盈: 比例={r:.4f}")
                     else:
+                        # 无对冲持仓时，固定2%止盈
                         exit_price = self.latest_price * 1.02
                         logger.info("🔄 多头装死止盈: 无对冲，固定2%")
 
@@ -520,13 +573,17 @@ class GridBot:
                 else:
                     logger.debug(f"多头装死模式：已有止盈单({counts['sell_orders']})，跳过")
             else:
+                # 正常网格模式 (对齐 Binance line 658-664)
                 logger.info(f"多头正常网格模式 (持仓={self.long_position})")
 
+                # 撤销现有订单并重新下单
                 await self.batch_manager.cancel_orders_for_side_safe(self.symbol, 'long')
 
+                # 计算网格价格
                 exit_price = self.latest_price * (1 + self.grid_spacing)
                 entry_price = self.latest_price * (1 - self.grid_spacing)
 
+                # 下止盈单和补仓单
                 await self.place_order_safe('sell', exit_price, quantity, 'long')
                 await self.place_order_safe('buy', entry_price, quantity, 'long')
                 logger.info(f"✅ 多头网格: 止盈@${exit_price:.6f}, 补仓@${entry_price:.6f}")
@@ -535,21 +592,29 @@ class GridBot:
             logger.error(f"多头订单失败: {e}")
 
     async def place_short_orders(self, latest_price):
-        """挂空头订单"""
+        """
+        挂空头订单 (对齐 Binance 参考实现 line 669-693)
+        """
         try:
             position_threshold = self.get_position_threshold()
             quantity = self.get_take_profit_quantity(self.short_position, 'short')
 
+            # 检查持仓是否超过阈值 (对齐 Binance line 675-681)
             if self.short_position > position_threshold:
                 logger.info(f"空头持仓过大 ({self.short_position})，进入装死模式")
+
+                # 检查是否已有止盈单 (对齐 Binance: if self.buy_short_orders <= 0)
                 tracker = self.order_manager.get_tracker(self.symbol)
                 counts = tracker.get_order_counts()
-                if counts['buy_orders'] <= 0:
+                if counts['buy_orders'] <= 0:  # 没有空头止盈单时才下新单
+                    # 装死模式：只下止盈单 (对齐 Binance)
                     if self.long_position > 0:
+                        # 动态止盈比例计算 (对齐 Binance line 678)
                         r = float((self.short_position / self.long_position) / 100 + 1)
-                        exit_price = self.latest_price / r
+                        exit_price = self.latest_price / r  # 空头反向
                         logger.info(f"🔄 空头装死止盈: 比例={1/r:.4f}")
                     else:
+                        # 无对冲持仓时，固定2%止盈
                         exit_price = self.latest_price * 0.98
                         logger.info("🔄 空头装死止盈: 无对冲，固定2%")
 
@@ -558,13 +623,17 @@ class GridBot:
                 else:
                     logger.debug(f"空头装死模式：已有止盈单({counts['buy_orders']})，跳过")
             else:
+                # 正常网格模式 (对齐 Binance line 684-690)
                 logger.info(f"空头正常网格模式 (持仓={self.short_position})")
 
+                # 撤销现有订单并重新下单
                 await self.batch_manager.cancel_orders_for_side_safe(self.symbol, 'short')
 
+                # 计算网格价格
                 exit_price = self.latest_price * (1 - self.grid_spacing)
                 entry_price = self.latest_price * (1 + self.grid_spacing)
 
+                # 下止盈单和补仓单
                 await self.place_order_safe('buy', exit_price, quantity, 'short')
                 await self.place_order_safe('sell', entry_price, quantity, 'short')
                 logger.info(f"✅ 空头网格: 止盈@${exit_price:.6f}, 补仓@${entry_price:.6f}")
@@ -573,103 +642,107 @@ class GridBot:
             logger.error(f"空头订单失败: {e}")
 
     async def check_and_reduce_positions(self):
-        """检查持仓并减少库存风险 - NUR LONG"""
+        """
+        检查持仓并减少库存风险 (对齐 Binance 参考实现 line 732-754)
+        """
         try:
             position_threshold = self.get_position_threshold()
+            # 设置持仓阈值 (对齐 Binance local_position_threshold = POSITION_THRESHOLD * 0.8)
             local_threshold = position_threshold * INVENTORY_REDUCTION_RATIO
-            reduce_quantity = position_threshold * 0.1
+            reduce_quantity = position_threshold * 0.1  # 平仓数量
 
-            if self.long_position >= local_threshold:
-                logger.warning(f"⚠️ Long-Position zu groß: {self.long_position}")
-                logger.info(f"🔄 Starte Risikoreduktion, Threshold={local_threshold}, Menge={reduce_quantity}")
+            # 双向持仓过大风险控制 (对齐 Binance line 741-753)
+            if (self.long_position >= local_threshold and
+                self.short_position >= local_threshold):
+
+                logger.warning(f"⚠️ 双向持仓风险: 多头={self.long_position}, 空头={self.short_position}")
+                logger.info(f"🔄 启动库存风险控制，阈值={local_threshold}, 平仓量={reduce_quantity}")
 
                 if self.dry_run:
-                    logger.info(f"🔄 DRY RUN - Long-Reduktion: {reduce_quantity}")
+                    logger.info(f"🔄 DRY RUN - 双向市价平仓: {reduce_quantity}")
                     self.long_position = max(0, self.long_position - reduce_quantity)
+                    self.short_position = max(0, self.short_position - reduce_quantity)
+                    logger.info(f"✅ 模拟双向平仓完成，剩余: 多头={self.long_position}, 空头={self.short_position}")
                 else:
+                    # 实际执行市价平仓 (对齐 Binance)
+                    logger.info("⚡ 实盘模式：执行双向市价平仓")
+
+                    # 平多头持仓 (卖出)
                     if self.long_position > 0:
                         sell_result = await self.place_market_order('sell', reduce_quantity, 'long')
                         if sell_result:
-                            logger.info(f"✅ Long-Reduktion erfolgreich: {reduce_quantity}")
+                            logger.info(f"✅ 多头平仓成功: {reduce_quantity}")
                             self.long_position = max(0, self.long_position - reduce_quantity)
                         else:
-                            logger.error("❌ Long-Reduktion fehlgeschlagen")
+                            logger.error("❌ 多头平仓失败")
 
-            # Short-Teil komplett deaktiviert
-            # if self.short_position >= local_threshold:
-            #     ... Short-Logik ...
+                    # 平空头持仓 (买入)
+                    if self.short_position > 0:
+                        buy_result = await self.place_market_order('buy', reduce_quantity, 'short')
+                        if buy_result:
+                            logger.info(f"✅ 空头平仓成功: {reduce_quantity}")
+                            self.short_position = max(0, self.short_position - reduce_quantity)
+                        else:
+                            logger.error("❌ 空头平仓失败")
 
-            logger.debug(f"📊 Nach Risikokontrolle: Long={self.long_position}")
+                    logger.info(f"📊 平仓后持仓: 多头={self.long_position}, 空头={self.short_position}")
 
         except Exception as e:
             logger.error(f"持仓风险控制失败: {e}")
 
     async def adjust_grid_strategy(self):
-        """网格策略主逻辑 - NUR LONG (Nur bei Bedarf aktualisieren)"""
+        """网格策略主逻辑 (对齐 Binance 参考实现)"""
         try:
+            # 检查价格是否有效
             if self.latest_price <= 0:
                 logger.debug("等待有效价格...")
                 return
 
-            # ====== Prüfe, ob Grid-Orders existieren ======
-            tracker = self.order_manager.get_tracker(self.symbol)
-            counts = tracker.get_order_counts()
-            
-            # Wenn beide Orders existieren, NUR bei Preisänderung aktualisieren
-            if counts['sell_orders'] > 0 and counts['buy_orders'] > 0:
-                # Prüfe Preisänderung
-                if self.last_order_price == 0:
-                    # Erste Preisaktualisierung → Orders setzen
-                    pass
-                else:
-                    # Preisänderung berechnen
-                    price_change_pct = abs(self.latest_price - self.last_order_price) / self.last_order_price
-                    if price_change_pct < self.price_update_threshold:
-                        # Keine ausreichende Preisänderung → nichts tun
-                        logger.debug(f"⏸️ Preisänderung zu gering: {price_change_pct:.4f} < {self.price_update_threshold:.4f}")
-                        return
-            
-            # Wenn eine Order fehlt ODER Preisänderung ausreichend ist, neu setzen
-            logger.debug(f"🔄 Setze Grid-Orders (${self.latest_price:.6f})")
+            # 检查是否需要更新订单 (基于价格阈值)
+            if not self.should_update_orders(self.latest_price):
+                return
 
+            logger.debug(f"价格变动达到阈值，执行网格调整 (${self.latest_price:.6f})")
+
+            # ====== 双向持仓风控检查 (对齐 Binance line 776) ======
             await self.check_and_reduce_positions()
 
-            # ====== 多头策略逻辑 ======
+            # ====== 多头策略逻辑 (对齐 Binance line 780-793) ======
             if self.long_position == 0:
-                logger.info("🟢 Keine Position - starte Grid direkt")
-                await self.place_long_orders(self.latest_price)
+                logger.info("🟢 初始化多头订单")
+                await self.initialize_long_orders()
             else:
                 logger.debug(f"🔄 调整多头网格 (持仓={self.long_position})")
                 await self.place_long_orders(self.latest_price)
 
-            # ====== 空头策略逻辑 (DEAKTIVIERT) ======
-            # Short komplett auskommentiert
-            # if self.short_position == 0:
-            #     logger.info("🔴 初始化空头订单")
-            #     await self.initialize_short_orders()
-            # else:
-            #     logger.debug(f"🔄 调整空头网格 (持仓={self.short_position})")
-            #     await self.place_short_orders(self.latest_price)
+            # ====== 空头策略逻辑 (对齐 Binance line 795-808) ======
+            if self.short_position == 0:
+                logger.info("🔴 初始化空头订单")
+                await self.initialize_short_orders()
+            else:
+                logger.debug(f"🔄 调整空头网格 (持仓={self.short_position})")
+                await self.place_short_orders(self.latest_price)
 
-            # ====== Update Preis für Logging ======
+            # ====== 统一更新价格基准 (对齐 Binance 逻辑) ======
             self.update_last_order_price()
 
         except Exception as e:
             logger.error(f"网格策略执行失败: {e}")
 
     async def graceful_shutdown(self):
-        """优雅关闭"""
+        """优雅关闭 (对齐 Binance)"""
         logger.info("🛑 开始优雅关闭...")
         self.shutdown_requested = True
 
         try:
+            # 使用批量管理器撤销所有订单
             result = await self.batch_manager.cancel_all_orders_safe()
             if result['success']:
                 logger.info("✅ 所有订单已撤销")
             else:
                 logger.warning(f"⚠️ 撤销订单可能有问题: {result.get('error', 'Unknown')}")
 
-            logger.info("💰 持仓保留")
+            logger.info("💰 持仓保留 (对齐 Binance 参考)")
         except Exception as e:
             logger.error(f"关闭失败: {e}")
 
@@ -678,10 +751,12 @@ class GridBot:
         mode_str = "DRY RUN" if self.dry_run else "LIVE TRADING"
         logger.info(f"🚀 启动简化网格机器人 ({mode_str})")
 
+        # 启动价格 WebSocket
         price_task = asyncio.create_task(self.price_ws.initialize_and_run())
 
+        # 等待价格数据
         logger.info("等待价格数据...")
-        for _ in range(20):
+        for _ in range(20):  # 10秒超时
             if self.latest_price > 0:
                 break
             await asyncio.sleep(0.5)
@@ -693,10 +768,11 @@ class GridBot:
 
         logger.info(f"✅ 价格: ${self.latest_price:.6f}")
 
-        current_time = time.time()
-        last_stats_time = current_time
-        last_position_sync_time = current_time
-        last_order_sync_time = current_time
+        # 主循环
+        current_time = time.time()  # 获取当前时间
+        last_stats_time = current_time  # 初始化为当前时间，避免启动时立即触发
+        last_position_sync_time = current_time  # 初始化为当前时间，避免启动时立即触发
+        last_order_sync_time = current_time  # 初始化为当前时间，避免启动时立即触发
         loop_count = 0
 
         logger.info("📊 启动完成，开始运行策略")
@@ -706,23 +782,27 @@ class GridBot:
                 loop_count += 1
                 current_time = time.time()
 
+                # 显示状态 (节流日志)
                 if loop_count % LOG_THROTTLE_FACTOR == 1:
                     logger.info(f"价格: ${self.latest_price:.6f}, 持仓: 多头={self.long_position}, 空头={self.short_position}")
 
+                # 智能订单同步 (降低频率)
                 if current_time - last_order_sync_time > ORDER_SYNC_INTERVAL:
                     await self.order_manager.sync_orders_from_api(self.symbol)
                     tracker = self.order_manager.get_tracker(self.symbol)
                     counts = tracker.get_order_counts()
-                    if loop_count % LOG_THROTTLE_FACTOR == 1:
+                    if loop_count % LOG_THROTTLE_FACTOR == 1:  # 节流日志
                         logger.info(f"订单: {counts['total_active']} 个活跃")
                     last_order_sync_time = current_time
 
+                # 智能持仓同步 (大幅降低频率 + 条件触发)
                 should_sync_position = (
                     current_time - last_position_sync_time > POSITION_SYNC_INTERVAL or
-                    (current_time - last_position_sync_time > 60 and (
-                        self.long_position == 0 or
+                    # 在特殊情况下强制同步持仓：
+                    (current_time - last_position_sync_time > 60 and (  # 至少60秒后才考虑条件同步
+                        self.long_position == 0 or  # 无持仓时需要及时检测新开仓
                         self.short_position == 0 or
-                        abs(self.long_position) > self.get_position_threshold() * 0.5 or
+                        abs(self.long_position) > self.get_position_threshold() * 0.5 or  # 持仓较大时更频繁检查
                         abs(self.short_position) > self.get_position_threshold() * 0.5
                     ))
                 )
@@ -737,14 +817,17 @@ class GridBot:
 
                     last_position_sync_time = current_time
 
+                # 定期显示官方统计信息
                 if current_time - last_stats_time > STATS_DISPLAY_INTERVAL:
                     stats = await self.get_account_stats()
                     if stats:
                         self.print_account_stats(stats)
                     last_stats_time = current_time
 
+                # 执行策略
                 await self.adjust_grid_strategy()
 
+                # 休眠 (可响应中断)
                 for _ in range(10):
                     if self.shutdown_requested:
                         break
@@ -755,6 +838,7 @@ class GridBot:
         finally:
             await self.graceful_shutdown()
 
+        # 清理
         price_task.cancel()
         if self.price_ws:
             self.price_ws.shutdown()
@@ -779,6 +863,7 @@ async def main():
                         help=f'价格变动阈值 (默认: {PRICE_UPDATE_THRESHOLD:.4f} = {PRICE_UPDATE_THRESHOLD*100:.2f}%%)')
     args = parser.parse_args()
 
+    # 创建机器人
     bot = GridBot(
         dry_run=args.dry_run,
         max_orders_per_side=args.max_orders,
@@ -788,6 +873,7 @@ async def main():
     )
     bot.symbol = args.symbol
 
+    # 输出当前配置
     logger.info(f"🚀 启动参数配置:")
     logger.info(f"   交易对: {args.symbol}")
     logger.info(f"   模式: {'模拟交易' if args.dry_run else '实盘交易'}")
@@ -801,6 +887,7 @@ async def main():
     if not args.dry_run:
         logger.warning("⚠️ 实盘交易模式启动!")
 
+    # 信号处理 (对齐 Binance)
     def signal_handler(signum, frame):
         logger.info(f"收到信号 {signum}，关闭中...")
         bot.shutdown_requested = True

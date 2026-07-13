@@ -45,7 +45,7 @@ ORDER_FIRST_TIME = 2          # 首单间隔2秒 (提高响应速度)
 # 新增优化参数 - 平衡效率与持仓规模
 MAX_ORDERS_PER_SIDE = 20        # 单边最大订单数 (减少复杂度，集中资金)
 ORDER_REFRESH_INTERVAL = 20    # 订单刷新间隔(秒) (降低频率，减少手续费)
-PRICE_UPDATE_THRESHOLD = 0.0002  # 价格变动阈值 0.02% (减少噪音交易)
+PRICE_UPDATE_THRESHOLD = 0.005  # 价格变动阈值 0.5% (减少噪音交易)
 
 # 🚀 动态止盈参数 (对齐 Binance 参考实现)
 DYNAMIC_PROFIT_MIN = 0.005    # 最小止盈率 0.5%
@@ -611,10 +611,9 @@ class GridBot:
                 logger.debug("等待有效价格...")
                 return
 
-            if not self.should_update_orders(self.latest_price):
-                return
-
-            logger.debug(f"价格变动达到阈值，执行网格调整 (${self.latest_price:.6f})")
+            # 🔥 ENTFERNT: Preis-Threshold-Check
+            # Jetzt wird IMMER das Grid gesetzt!
+            logger.debug(f"Führe Grid-Anpassung aus (${self.latest_price:.6f})")
 
             await self.check_and_reduce_positions()
 
@@ -627,6 +626,7 @@ class GridBot:
                 await self.place_long_orders(self.latest_price)
 
             # ====== 空头策略逻辑 (DEAKTIVIERT) ======
+            # Short komplett auskommentiert
             # if self.short_position == 0:
             #     logger.info("🔴 初始化空头订单")
             #     await self.initialize_short_orders()
@@ -634,7 +634,8 @@ class GridBot:
             #     logger.debug(f"🔄 调整空头网格 (持仓={self.short_position})")
             #     await self.place_short_orders(self.latest_price)
 
-            self.update_last_order_price()
+            # ====== 更新 Preis für Logging ======
+            self.last_order_price = self.latest_price
 
         except Exception as e:
             logger.error(f"网格策略执行失败: {e}")

@@ -611,9 +611,12 @@ class GridBot:
                 logger.debug("等待有效价格...")
                 return
 
-            # 🔥 ENTFERNT: Preis-Threshold-Check
-            # Jetzt wird IMMER das Grid gesetzt!
-            logger.debug(f"Führe Grid-Anpassung aus (${self.latest_price:.6f})")
+            # 🔥 Preis-Threshold WIEDER AKTIVIERT
+            # Nur bei ausreichender Preisbewegung werden Orders aktualisiert
+            if not self.should_update_orders(self.latest_price):
+                return
+
+            logger.debug(f"价格变动达到阈值，执行网格调整 (${self.latest_price:.6f})")
 
             await self.check_and_reduce_positions()
 
@@ -635,7 +638,7 @@ class GridBot:
             #     await self.place_short_orders(self.latest_price)
 
             # ====== 更新 Preis für Logging ======
-            self.last_order_price = self.latest_price
+            self.update_last_order_price()
 
         except Exception as e:
             logger.error(f"网格策略执行失败: {e}")

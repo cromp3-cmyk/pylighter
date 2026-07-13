@@ -605,17 +605,23 @@ class GridBot:
             logger.error(f"持仓风险控制失败: {e}")
 
     async def adjust_grid_strategy(self):
-        """网格策略主逻辑 - NUR LONG (VOLLAUTOMATISCH)"""
+        """网格策略主逻辑 - NUR LONG (Intelligente Order-Aktualisierung)"""
         try:
             if self.latest_price <= 0:
                 logger.debug("等待有效价格...")
                 return
 
-            # 🔥 ENTFERNE die Preis-Threshold-Prüfung KOMPLETT
-            # Der Bot setzt IMMER Grid-Orders, bei jedem Durchlauf
-            # if not self.should_update_orders(self.latest_price):
-            #     return
-
+            # ====== Prüfe, ob Grid-Orders existieren ======
+            tracker = self.order_manager.get_tracker(self.symbol)
+            counts = tracker.get_order_counts()
+            
+            # Wenn beide Orders existieren, nur bei Preisänderung aktualisieren
+            if counts['sell_orders'] > 0 and counts['buy_orders'] > 0:
+                # Normale Preis-Threshold-Prüfung
+                if not self.should_update_orders(self.latest_price):
+                    return
+            
+            # Wenn eine Order fehlt, sofort neu setzen
             logger.debug(f"Führe Grid-Anpassung aus (${self.latest_price:.6f})")
 
             await self.check_and_reduce_positions()
@@ -638,7 +644,7 @@ class GridBot:
             #     await self.place_short_orders(self.latest_price)
 
             # ====== Update Preis für Logging ======
-            self.last_order_price = self.latest_price
+            self.update_last_order_price()
 
         except Exception as e:
             logger.error(f"网格策略执行失败: {e}")

@@ -575,7 +575,7 @@ class GridBot:
             logger.error(f"持仓风险控制失败: {e}")
 
     async def adjust_grid_strategy(self):
-        """网格策略主逻辑 - NUR LONG"""
+        """网格策略主逻辑 - NUR LONG mit sofortiger Market-Order"""
         try:
             if self.latest_price <= 0:
                 logger.debug("等待有效价格...")
@@ -591,8 +591,39 @@ class GridBot:
 
             # ====== 多头策略逻辑 ======
             if self.long_position == 0:
-                logger.info("🟢 Keine Position - starte Grid direkt")
-                await self.place_long_orders(self.latest_price)
+                logger.info("🟢 Keine Position - kaufe sofort mit Market-Order!")
+                
+                # 🔥 Sofort mit Market-Order kaufen
+                if not self.dry_run:
+                    if self.long_initial_quantity > 0:
+                        logger.info(f"⚡ Kaufe {self.long_initial_quantity} {self.symbol} sofort (Market-Order)")
+                        result = await self.lighter.market_order(
+                            ticker=self.symbol,
+                            amount=abs(self.long_initial_quantity)
+                        )
+                        if result:
+                            logger.info(f"✅ Market-Order erfolgreich!")
+                            # Kurz warten, bis Position aktualisiert ist
+                            await asyncio.sleep(1)
+                            self.long_position, _ = await self.get_positions()
+                        else:
+                            logger.error("❌ Market-Order fehlgeschlagen!")
+                            return
+                    else:
+                        logger.warning(f"⚠️ Keine Menge zum Kaufen: {self.long_initial_quantity}")
+                        return
+                else:
+                    # Dry-Run
+                    logger.info(f"🔄 DRY RUN - Kaufe {self.long_initial_quantity} {self.symbol}")
+                    self.long_position = self.long_initial_quantity
+                    self.avg_entry_price = self.latest_price
+                
+                # Nach dem Kauf Grid-Orders setzen
+                if self.long_position > 0:
+                    logger.info(f"📊 Position: {self.long_position} @ ${self.avg_entry_price:.6f}")
+                    await self.place_long_orders(self.latest_price)
+                else:
+                    logger.warning("⚠️ Keine Position nach Market-Order!")
             else:
                 logger.debug(f"🔄 调整多头网格 (持仓={self.long_position})")
                 await self.place_long_orders(self.latest_price)
@@ -679,6 +710,7 @@ class GridBot:
                     logger.debug("📊 同步持仓状态...")
                     old_long, old_short = self.long_position, self.short_position
                     self.long_position, self.short_position = await self.get_positions()
+                    self.avg_entry_price = 0  # Wird später von place_long_orders aktualisiert
 
                     if old_long != self.long_position or old_short != self.short_position:
                         logger.info(f"🔄 持仓更新: 多头 {old_long}→{self.long_position}, 空头 {old_short}→{self.short_position}")

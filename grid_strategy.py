@@ -36,7 +36,7 @@ logger = get_strategy_logger("grid")
 COIN_NAME = "XRP"
 
 # 🎯 优化后的核心参数 - 专注提高持仓规模
-GRID_SPACING = 0.002         # 0.2% 网格间距 (Nachkauf-Abstand)
+GRID_SPACING = 0.0012         # 0.12% 网格间距 (Nachkauf-Abstand)
 INITIAL_QUANTITY = 100.0       # 每单 $100 USD
 LEVERAGE = 10                 # 10倍杠杆
 POSITION_THRESHOLD_RATIO = 0.5   # 持仓阈值比例 (50%)
@@ -485,11 +485,42 @@ class GridBot:
 
     async def initialize_short_orders(self):
         """初始化空头订单 (DEAKTIVIERT - NUR LONG)"""
-        # Short-Strategie komplett ausgeschaltet
         return
 
+    async def buy_immediately(self):
+        """Kauft sofort mit Market-Order (für Neustart nach Verkauf)"""
+        if self.long_initial_quantity > 0:
+            logger.info(f"⚡ Kaufe {self.long_initial_quantity} {self.symbol} sofort (Market-Order)")
+            if not self.dry_run:
+                result = await self.lighter.market_order(
+                    ticker=self.symbol,
+                    amount=abs(self.long_initial_quantity)
+                )
+                if result:
+                    logger.info(f"✅ Market-Order erfolgreich!")
+                    await asyncio.sleep(1)
+                    self.long_position, _ = await self.get_positions()
+                    # Durchschnittspreis aktualisieren
+                    if self.long_position > 0:
+                        stats = await self.get_account_stats()
+                        current_pos = stats.get('current_position', {})
+                        if current_pos:
+                            self.avg_entry_price = float(current_pos.get('avg_entry_price', 0))
+                    return True
+                else:
+                    logger.error("❌ Market-Order fehlgeschlagen!")
+                    return False
+            else:
+                logger.info(f"🔄 DRY RUN - Kaufe {self.long_initial_quantity} {self.symbol}")
+                self.long_position = self.long_initial_quantity
+                self.avg_entry_price = self.latest_price
+                return True
+        else:
+            logger.warning(f"⚠️ Keine Menge zum Kaufen: {self.long_initial_quantity}")
+            return False
+
     async def place_long_orders(self, latest_price):
-        """挂多头订单 - NUR LONG mit Gewinnziel"""
+        """挂多头订单 - NUR LONG mit Gewinnziel und sofortigem Neustart"""
         try:
             position_threshold = self.get_position_threshold()
             quantity = self.get_take_profit_quantity(self.long_position, 'long')
@@ -499,7 +530,6 @@ class GridBot:
                 tracker = self.order_manager.get_tracker(self.symbol)
                 counts = tracker.get_order_counts()
                 if counts['sell_orders'] <= 0:
-                    # 🔥 Verkaufe erst bei Gewinn (Take-Profit in %)
                     take_profit_decimal = self.take_profit_percent / 100.0
                     
                     if self.avg_entry_price > 0:
@@ -532,18 +562,31 @@ class GridBot:
                     logger.info("📊 Kein Durchschnittspreis - verwende Grid-Spacing")
 
                 # Verkaufs-Order (Take-Profit)
-                await self.place_order_safe('sell', exit_price, quantity, 'long')
+                sell_order = await self.place_order_safe('sell', exit_price, quantity, 'long')
                 # Nachkauf-Order
-                await self.place_order_safe('buy', entry_price, quantity, 'long')
+                buy_order = await self.place_order_safe('buy', entry_price, quantity, 'long')
                 
-                logger.info(f"✅ 多头网格: 止盈@${exit_price:.6f} ({self.take_profit_percent:.1f}% Gewinn), 补仓@${entry_price:.6f}")
+                if sell_order and buy_order:
+                    logger.info(f"✅ 多头网格: 止盈@${exit_price:.6f} ({self.take_profit_percent:.1f}% Gewinn), 补仓@${entry_price:.6f}")
+                    
+                    # 🔥 Wenn beide Orders gesetzt wurden und die Position nach dem Verkauf auf 0 geht
+                    # prüfe, ob die Position bereits geschlossen wurde
+                    if self.long_position > 0:
+                        # Warte kurz, ob die Verkaufs-Order ausgeführt wird
+                        await asyncio.sleep(0.5)
+                        # Prüfe, ob die Position noch existiert
+                        current_pos, _ = await self.get_positions()
+                        if current_pos == 0 and self.long_position > 0:
+                            logger.info("🔄 Position wurde geschlossen - starte neu mit Market-Order!")
+                            self.long_position = 0
+                            self.avg_entry_price = 0
+                            await self.buy_immediately()
 
         except Exception as e:
             logger.error(f"多头订单失败: {e}")
 
     async def place_short_orders(self, latest_price):
         """挂空头订单 (DEAKTIVIERT - NUR LONG)"""
-        # Short-Strategie komplett ausgeschaltet
         return
 
     async def check_and_reduce_positions(self):
@@ -575,7 +618,7 @@ class GridBot:
             logger.error(f"持仓风险控制失败: {e}")
 
     async def adjust_grid_strategy(self):
-        """网格策略主逻辑 - NUR LONG mit sofortiger Market-Order"""
+        """网格策略主逻辑 - NUR LONG mit sofortiger Market-Order beim Start und nach Verkauf"""
         try:
             if self.latest_price <= 0:
                 logger.debug("等待有效价格...")
@@ -592,37 +635,7 @@ class GridBot:
             # ====== 多头策略逻辑 ======
             if self.long_position == 0:
                 logger.info("🟢 Keine Position - kaufe sofort mit Market-Order!")
-                
-                # 🔥 Sofort mit Market-Order kaufen
-                if not self.dry_run:
-                    if self.long_initial_quantity > 0:
-                        logger.info(f"⚡ Kaufe {self.long_initial_quantity} {self.symbol} sofort (Market-Order)")
-                        result = await self.lighter.market_order(
-                            ticker=self.symbol,
-                            amount=abs(self.long_initial_quantity)
-                        )
-                        if result:
-                            logger.info(f"✅ Market-Order erfolgreich!")
-                            # Kurz warten, bis Position aktualisiert ist
-                            await asyncio.sleep(1)
-                            self.long_position, _ = await self.get_positions()
-                            # Durchschnittspreis aktualisieren
-                            if self.long_position > 0:
-                                stats = await self.get_account_stats()
-                                current_pos = stats.get('current_position', {})
-                                if current_pos:
-                                    self.avg_entry_price = float(current_pos.get('avg_entry_price', 0))
-                        else:
-                            logger.error("❌ Market-Order fehlgeschlagen!")
-                            return
-                    else:
-                        logger.warning(f"⚠️ Keine Menge zum Kaufen: {self.long_initial_quantity}")
-                        return
-                else:
-                    # Dry-Run
-                    logger.info(f"🔄 DRY RUN - Kaufe {self.long_initial_quantity} {self.symbol}")
-                    self.long_position = self.long_initial_quantity
-                    self.avg_entry_price = self.latest_price
+                await self.buy_immediately()
                 
                 # Nach dem Kauf Grid-Orders setzen
                 if self.long_position > 0:
@@ -633,9 +646,6 @@ class GridBot:
             else:
                 logger.debug(f"🔄 调整多头网格 (持仓={self.long_position})")
                 await self.place_long_orders(self.latest_price)
-
-            # ====== 空头策略逻辑 (DEAKTIVIERT) ======
-            # Short komplett ausgeschaltet
 
             self.update_last_order_price()
 
@@ -767,8 +777,8 @@ async def main():
                         help=f'每单金额 USD (默认: ${INITIAL_QUANTITY})')
     parser.add_argument('--price-threshold', type=float, default=PRICE_UPDATE_THRESHOLD,
                         help=f'价格变动阈值 (默认: {PRICE_UPDATE_THRESHOLD:.4f} = {PRICE_UPDATE_THRESHOLD*100:.2f}%%)')
-    parser.add_argument('--take-profit', type=float, default=1.0,
-                        help='Gewinnziel in % (z.B. 1.0 für 1%%, 2.0 für 2%%)')
+    parser.add_argument('--take-profit', type=float, default=0.1,
+                        help='Gewinnziel in % (z.B. 0.1 für 0.1%%, 0.5 für 0.5%%)')
     args = parser.parse_args()
 
     bot = GridBot(
@@ -777,7 +787,7 @@ async def main():
         grid_spacing=args.grid_spacing,
         order_amount=args.order_amount,
         price_threshold=args.price_threshold,
-        take_profit_percent=args.take_profit  # 🔥 HIER wird der Parameter übergeben!
+        take_profit_percent=args.take_profit
     )
     bot.symbol = args.symbol
 

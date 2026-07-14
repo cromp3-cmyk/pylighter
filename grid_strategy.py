@@ -606,6 +606,12 @@ class GridBot:
                             # Kurz warten, bis Position aktualisiert ist
                             await asyncio.sleep(1)
                             self.long_position, _ = await self.get_positions()
+                            # Durchschnittspreis aktualisieren
+                            if self.long_position > 0:
+                                stats = await self.get_account_stats()
+                                current_pos = stats.get('current_position', {})
+                                if current_pos:
+                                    self.avg_entry_price = float(current_pos.get('avg_entry_price', 0))
                         else:
                             logger.error("❌ Market-Order fehlgeschlagen!")
                             return
@@ -710,7 +716,11 @@ class GridBot:
                     logger.debug("📊 同步持仓状态...")
                     old_long, old_short = self.long_position, self.short_position
                     self.long_position, self.short_position = await self.get_positions()
-                    self.avg_entry_price = 0  # Wird später von place_long_orders aktualisiert
+                    if self.long_position > 0:
+                        stats = await self.get_account_stats()
+                        current_pos = stats.get('current_position', {})
+                        if current_pos:
+                            self.avg_entry_price = float(current_pos.get('avg_entry_price', 0))
 
                     if old_long != self.long_position or old_short != self.short_position:
                         logger.info(f"🔄 持仓更新: 多头 {old_long}→{self.long_position}, 空头 {old_short}→{self.short_position}")
@@ -767,7 +777,7 @@ async def main():
         grid_spacing=args.grid_spacing,
         order_amount=args.order_amount,
         price_threshold=args.price_threshold,
-        take_profit_percent=args.take_profit
+        take_profit_percent=args.take_profit  # 🔥 HIER wird der Parameter übergeben!
     )
     bot.symbol = args.symbol
 
